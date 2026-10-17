@@ -13,12 +13,10 @@ pub const WORLD_HEIGHT: usize = 384;
 
 #[derive(Deserialize)]
 pub struct ChunkNbt {
-    #[serde(rename = "Heightmaps")]
-    _heightmaps: Option<serde_json::Value>,
+    // Heightmaps (long arrays) and block_entities are not needed for rendering;
+    // unknown fields are ignored by serde, so they are simply not declared.
     #[serde(rename = "sections")]
     pub sections: Vec<SectionNbt>,
-    #[serde(rename = "block_entities")]
-    _block_entities: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -38,8 +36,21 @@ pub struct BlockStatesNbt {
 use fastnbt::LongArray;
 
 #[derive(Deserialize)]
-struct PaletteEntryNbt {
-    name: String,
+#[serde(untagged)]
+enum PaletteEntryNbt {
+    /// Modern (26.3+): palette is a bare TAG_String, e.g. "minecraft:stone"
+    Direct(String),
+    /// Older: palette entry is a compound { name: "minecraft:stone", ... }
+    Named { name: String },
+}
+
+impl PaletteEntryNbt {
+    fn name(&self) -> &str {
+        match self {
+            PaletteEntryNbt::Direct(s) => s,
+            PaletteEntryNbt::Named { name } => name,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,12 +252,13 @@ impl BlockWorld {
             // Local palette -> global palette indices
             let mut local_to_global = Vec::with_capacity(bs.palette.len());
             for entry in &bs.palette {
-                let idx = match palette_map.get(&entry.name) {
+                let entry_name = entry.name();
+                let idx = match palette_map.get(entry_name) {
                     Some(i) => *i,
                     None => {
-                        palette.push(entry.name.clone());
+                        palette.push(entry_name.to_string());
                         let i = (palette.len() - 1) as u16;
-                        palette_map.insert(entry.name.clone(), i);
+                        palette_map.insert(entry_name.to_string(), i);
                         i
                     }
                 };
