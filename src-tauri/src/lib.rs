@@ -14,6 +14,7 @@ use world::{RenderStats, TileEntry, TileManifest, WorldRenderer};
 #[derive(Default)]
 pub struct RenderState {
     out_dir: Mutex<Option<PathBuf>>,
+    stop_watcher: Mutex<Option<std::sync::Arc<AtomicUsize>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -135,9 +136,12 @@ async fn load_manifest(manifest_path: String) -> Result<serde_json::Value, Strin
         .map_err(|e| e.to_string())
 }
 
+/// GLB tiles can be several MB; returning Vec<u8> would serialize them as a
+/// JSON number array (~10x overhead). The raw IPC response streams bytes.
 #[tauri::command]
-async fn read_glb(path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&path).map_err(|e| format!("failed to read {path}: {e}"))
+async fn read_glb(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Format diagnostics: dump the raw NBT structure of the first readable
@@ -178,8 +182,13 @@ async fn dump_chunk(world_dir: String) -> Result<String, String> {
 #[tauri::command]
 async fn start_watching(
     app: AppHandle,
+    state: State<'_, RenderState>,
     world_dir: String,
 ) -> Result<(), String> {
+    // Stop any previous watcher before starting a new one.
+    if let Some(stop) = state.stop_watcher.lock().await.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
     let world_path = PathBuf::from(&world_dir);
     // Watch the same directories the renderer reads from: legacy <world>/region
     // or the 2026 layout <world>/dimensions/minecraft/overworld/region.
@@ -195,6 +204,9 @@ async fn start_watching(
         }
     };
 
+    let stop = std::sync::Arc::new(AtomicUsize::new(0));
+    *state.stop_watcher.lock().await = Some(stop.clone());
+
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
         let (wtx, wrx) = std::sync::mpsc::channel();
@@ -204,15 +216,25 @@ async fn start_watching(
         if watcher.watch(&region_dir, RecursiveMode::NonRecursive).is_err() {
             return;
         }
-        // Keep the watcher alive for the lifetime of the channel loop.
-        while let Ok(ev) = wrx.recv() {
-            if let Ok(e) = ev {
-                let paths: Vec<String> = e
-                    .paths
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
-                let _ = app.emit("world-changed", serde_json::json!({ "paths": paths }));
+        // Poll with timeout so the stop flag is checked regularly.
+        loop {
+            match wrx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(ev) => {
+                    if let Ok(e) = ev {
+                        let paths: Vec<String> = e
+                            .paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                        let _ = app.emit("world-changed", serde_json::json!({ "paths": paths }));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Relaxed) != 0 {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         drop(watcher);

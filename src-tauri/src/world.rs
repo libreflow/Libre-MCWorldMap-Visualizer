@@ -29,15 +29,15 @@ pub struct SectionNbt {
 
 #[derive(Deserialize)]
 pub struct BlockStatesNbt {
-    palette: Vec<PaletteEntryNbt>,
-    data: Option<LongArray>,
+    pub palette: Vec<PaletteEntryNbt>,
+    pub data: Option<LongArray>,
 }
 
 use fastnbt::LongArray;
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum PaletteEntryNbt {
+pub enum PaletteEntryNbt {
     /// Modern (26.3+): palette is a bare TAG_String, e.g. "minecraft:stone"
     Direct(String),
     /// Compound entry { Name: "minecraft:...", Properties: {...} } — the
@@ -49,7 +49,7 @@ enum PaletteEntryNbt {
 }
 
 impl PaletteEntryNbt {
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             PaletteEntryNbt::Direct(s) => s,
             PaletteEntryNbt::Named { name } => name,
@@ -222,7 +222,13 @@ impl WorldRenderer {
 
         let file_name = format!("chunk_{cx}_{cz}.glb");
         let path = out_dir.join(&file_name);
-        GlbWriter::write(&path, &mesh.vertices, &mesh.indices).ok()?;
+        if let Err(e) = GlbWriter::write(&path, &mesh.vertices, &mesh.indices) {
+            stats.chunks_failed += 1;
+            if stats.parse_error_sample.is_none() {
+                stats.parse_error_sample = Some(format!("chunk {cx},{cz} glb write failed: {e}"));
+            }
+            return None;
+        }
 
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
@@ -253,6 +259,9 @@ impl BlockWorld {
 
         for section in &chunk.sections {
             let Some(bs) = &section.block_states else { continue };
+            if bs.palette.is_empty() {
+                continue;
+            }
             // Local palette -> global palette indices
             let mut local_to_global = Vec::with_capacity(bs.palette.len());
             for entry in &bs.palette {
@@ -282,7 +291,10 @@ impl BlockWorld {
                         if wy < WORLD_MIN_Y || wy >= WORLD_MIN_Y + WORLD_HEIGHT as i32 {
                             continue;
                         }
-                        let g = local_to_global[packed.get(i) as usize % local_to_global.len()];
+                        let g = local_to_global
+                            .get(packed.get(i) as usize % local_to_global.len())
+                            .copied()
+                            .unwrap_or(0);
                         let gi = ((wy - WORLD_MIN_Y) as usize * 16 + z) * 16 + x;
                         blocks[gi] = g;
                     }
@@ -392,6 +404,19 @@ fn collect_regions(region_dir: &Path, out: &mut Vec<(i32, i32, PathBuf)>) {
     }
 }
 
+/// True when the .mca file at `path` lives in a non-terrain folder such as
+/// `entities/` or `poi/` — those share the r.X.Z.mca naming but hold entity
+/// data, not block sections.
+fn is_non_terrain_region(path: &Path) -> bool {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| {
+            let n = n.to_string_lossy();
+            n == "entities" || n == "poi"
+        })
+        .unwrap_or(false)
+}
+
 fn collect_regions_recursive(
     dir: &Path,
     depth: usize,
@@ -414,7 +439,9 @@ fn collect_regions_recursive(
             }
             collect_regions_recursive(&path, depth + 1, out, searched);
         } else if let Some((rx, rz)) = parse_region_name(&path.file_name().unwrap_or_default().to_string_lossy()) {
-            out.push((rx, rz, path.clone()));
+            if !is_non_terrain_region(&path) {
+                out.push((rx, rz, path.clone()));
+            }
         }
     }
 }

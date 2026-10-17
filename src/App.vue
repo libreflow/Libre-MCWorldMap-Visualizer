@@ -107,6 +107,7 @@ let cacheDir = ''
 const gltfLoader = new GLTFLoader()
 const loaded = new Set<string>()
 const loading = new Set<string>()
+const loadedObjects: THREE.Object3D[] = []
 const tilesByXZ = new Map<string, TileEntry>()
 let unlistenFns: (() => void)[] = []
 
@@ -128,6 +129,15 @@ async function pickWorld() {
     }>('render_world', { worldDir: dir })
     renderStats.value = result.stats
     cacheDir = result.manifestPath.replace(/[/\\]settings\.json$/, '')
+    // Drop all previously loaded tiles so the new world doesn't stack on the old one.
+    for (const obj of loadedObjects.splice(0)) {
+      scene.remove(obj)
+      obj.traverse((o) => {
+        const mesh = o as THREE.Mesh
+        if (mesh.geometry) mesh.geometry.dispose()
+      })
+    }
+    loaded.clear()
     tilesByXZ.clear()
     tilesByCell.clear()
     loadedTiles.value = 0
@@ -182,10 +192,11 @@ async function loadTile(t: TileEntry) {
   if (loaded.has(key) || loading.has(key)) return
   loading.add(key)
   try {
-    const bytes = await invoke<number[]>('read_glb', { path: `${cacheDir}${PATH_SEP}${t.file}` })
-    const buf = new Uint8Array(bytes).buffer
+    // tauri::ipc::Response resolves directly to an ArrayBuffer on the JS side.
+    const buf = await invoke<ArrayBuffer>('read_glb', { path: `${cacheDir}${PATH_SEP}${t.file}` })
     const gltf = await gltfLoader.parseAsync(buf, '')
     scene.add(gltf.scene)
+    loadedObjects.push(gltf.scene)
     loaded.add(key)
     loadedTiles.value = loaded.size
   } catch {

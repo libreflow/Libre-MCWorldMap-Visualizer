@@ -8,6 +8,7 @@ struct GlbJson {
     scenes: [Scene; 1],
     nodes: [Node; 1],
     meshes: [Mesh; 1],
+    materials: [Material; 1],
     buffers: [Buffer; 1],
     #[serde(rename = "bufferViews")]
     buffer_views: Vec<BufferView>,
@@ -39,7 +40,24 @@ struct Mesh {
 struct Primitive {
     attributes: Attributes,
     indices: usize,
+    material: usize,
     mode: u32,
+}
+
+/// Explicit matte material: without it the glTF default is metallicFactor=1
+/// (a pure metal), which renders vertex-colored terrain nearly black.
+#[derive(Serialize)]
+struct Material {
+    #[serde(rename = "pbrMetallicRoughness")]
+    pbr_metallic_roughness: PbrMetallicRoughness,
+}
+
+#[derive(Serialize)]
+struct PbrMetallicRoughness {
+    #[serde(rename = "metallicFactor")]
+    metallic_factor: f32,
+    #[serde(rename = "roughnessFactor")]
+    roughness_factor: f32,
 }
 
 #[derive(Serialize)]
@@ -120,8 +138,15 @@ impl GlbWriter {
                 primitives: [Primitive {
                     attributes: Attributes { position: 0, color: 1 },
                     indices: 2,
+                    material: 0,
                     mode: 4,
                 }],
+            }],
+            materials: [Material {
+                pbr_metallic_roughness: PbrMetallicRoughness {
+                    metallic_factor: 0.0,
+                    roughness_factor: 1.0,
+                },
             }],
             buffers: [Buffer { byte_length: bin_len_unpadded }],
             buffer_views: vec![
