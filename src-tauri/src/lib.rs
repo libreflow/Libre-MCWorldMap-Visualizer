@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
-use world::{TileEntry, TileManifest, WorldRenderer};
+use world::{RenderStats, TileEntry, TileManifest, WorldRenderer};
 
 #[derive(Default)]
 pub struct RenderState {
@@ -61,14 +61,26 @@ async fn render_world(
     // `done` is shared between the render thread and the progress loop below.
     let done_thread = done.clone();
     let out_dir_thread = out_dir.clone();
+    let stats = std::sync::Arc::new(std::sync::Mutex::new(RenderStats::default()));
+    let stats_thread = stats.clone();
     let handle = std::thread::spawn(move || {
+        // `stats` stays with the async command; the thread uses `stats_thread`.
         let all_tiles: Vec<Vec<TileEntry>> = regions
             .par_iter()
             .map(|(rx, rz, path)| {
                 let label = format!("r.{rx}.{rz}");
-                let tiles = renderer
-                    .render_region(path, &out_dir_thread, *rx, *rz)
-                    .unwrap_or_default();
+                let mut local_stats = RenderStats::default();
+                let result = renderer.render_region(path, &out_dir_thread, *rx, *rz, &mut local_stats);
+                let tiles = result.unwrap_or_default();
+                if let Ok(mut s) = stats_thread.lock() {
+                    s.chunks_read += local_stats.chunks_read;
+                    s.chunks_parsed += local_stats.chunks_parsed;
+                    s.chunks_empty += local_stats.chunks_empty;
+                    s.chunks_failed += local_stats.chunks_failed;
+                    if s.parse_error_sample.is_none() {
+                        s.parse_error_sample = local_stats.parse_error_sample;
+                    }
+                }
                 done_thread.fetch_add(1, Ordering::Relaxed);
                 if let Ok(tx) = tx.lock() {
                     let _ = tx.send((label, tiles.clone()));
@@ -109,10 +121,18 @@ async fn render_world(
         DoneEvent { manifest_path: manifest_path.to_string_lossy().to_string(), tiles: tiles.len() },
     );
 
+    let final_stats = stats.lock().expect("stats mutex poisoned");
     Ok(serde_json::json!({
         "manifestPath": manifest_path.to_string_lossy(),
         "tileCount": tiles.len(),
         "regionCount": total,
+        "stats": {
+            "chunksRead": final_stats.chunks_read,
+            "chunksParsed": final_stats.chunks_parsed,
+            "chunksEmpty": final_stats.chunks_empty,
+            "chunksFailed": final_stats.chunks_failed,
+            "parseErrorSample": final_stats.parse_error_sample,
+        },
     }))
 }
 

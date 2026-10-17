@@ -61,6 +61,16 @@ pub struct WorldRenderer {
     pub mapper: BlockMapper,
 }
 
+/// Parsing/rendering statistics for one render pass, surfaced to the UI.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RenderStats {
+    pub chunks_read: usize,
+    pub chunks_parsed: usize,
+    pub chunks_empty: usize,
+    pub chunks_failed: usize,
+    pub parse_error_sample: Option<String>,
+}
+
 /// Bit-pack reader for packed 64-bit long arrays (Minecraft format).
 struct PackedBits {
     entries: Vec<u16>,
@@ -103,6 +113,7 @@ impl WorldRenderer {
         out_dir: &Path,
         rx: i32,
         rz: i32,
+        stats: &mut RenderStats,
     ) -> Result<Vec<TileEntry>, String> {
         let _ = (rx, rz);
         let mut region = open_region(region_path)?;
@@ -113,11 +124,17 @@ impl WorldRenderer {
             for lx in 0..32 {
                 let data = region.read_chunk(lx, lz);
                 let data = match data {
-                    Ok(Some(d)) => d,
+                    Ok(Some(d)) => {
+                        stats.chunks_read += 1;
+                        d
+                    }
                     Ok(None) => continue,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.chunks_failed += 1;
+                        continue;
+                    }
                 };
-                let tile = self.mesh_chunk(&data, out_dir, rx * 32 + lx as i32, rz * 32 + lz as i32);
+                let tile = self.mesh_chunk(&data, out_dir, rx * 32 + lx as i32, rz * 32 + lz as i32, stats);
                 if let Some(t) = tile {
                     tiles.push(t);
                 }
@@ -126,8 +143,27 @@ impl WorldRenderer {
         Ok(tiles)
     }
 
-    fn mesh_chunk(&self, nbt_bytes: &[u8], out_dir: &Path, cx: i32, cz: i32) -> Option<TileEntry> {
-        let chunk: ChunkNbt = from_bytes(nbt_bytes).ok()?;
+    fn mesh_chunk(
+        &self,
+        nbt_bytes: &[u8],
+        out_dir: &Path,
+        cx: i32,
+        cz: i32,
+        stats: &mut RenderStats,
+    ) -> Option<TileEntry> {
+        let chunk: ChunkNbt = match from_bytes(nbt_bytes) {
+            Ok(c) => {
+                stats.chunks_parsed += 1;
+                c
+            }
+            Err(e) => {
+                stats.chunks_failed += 1;
+                if stats.parse_error_sample.is_none() {
+                    stats.parse_error_sample = Some(format!("chunk {cx},{cz}: {e}"));
+                }
+                return None;
+            }
+        };
         let mut mesh = ChunkMesh::default();
 
         // Section Y -> sections map
@@ -165,6 +201,7 @@ impl WorldRenderer {
         }
 
         if mesh.vertices.is_empty() {
+            stats.chunks_empty += 1;
             return None;
         }
 

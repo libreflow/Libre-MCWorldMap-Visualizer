@@ -24,6 +24,8 @@
       </div>
       <div class="hud-bottom">
         <span>Clic gauche : orbite · Molette : zoom · Clic droit : pan</span>
+        <span v-if="renderStats">chunks : {{ renderStats.chunksRead }} lus, {{ renderStats.chunksParsed }} parsés, {{ renderStats.chunksEmpty }} vides, {{ renderStats.chunksFailed }} échoués</span>
+        <span v-if="renderStats?.parseErrorSample" class="error">{{ renderStats.parseErrorSample }}</span>
         <span v-if="flyMode">ZQSD/WASD + souris pour voler</span>
       </div>
     </div>
@@ -53,6 +55,14 @@ interface Manifest {
   tiles: TileEntry[]
 }
 
+interface RenderStats {
+  chunksRead: number
+  chunksParsed: number
+  chunksEmpty: number
+  chunksFailed: number
+  parseErrorSample: string | null
+}
+
 const canvasHost = ref<HTMLDivElement | null>(null)
 const phase = ref<'idle' | 'rendering' | 'viewing'>('idle')
 const busy = ref(false)
@@ -64,6 +74,7 @@ const worldName = ref('')
 const totalTiles = ref(0)
 const loadedTiles = ref(0)
 const flyMode = ref(false)
+const renderStats = ref<RenderStats | null>(null)
 
 const progressPct = computed(() => (total.value === 0 ? 0 : Math.round((done.value / total.value) * 100)))
 
@@ -89,16 +100,36 @@ async function pickWorld() {
     const dir = await open({ directory: true, multiple: false, title: 'Dossier du monde Minecraft' })
     if (!dir || typeof dir !== 'string') return
     phase.value = 'rendering'
-    const result = await invoke<{ manifestPath: string; tileCount: number; regionCount: number }>(
-      'render_world',
-      { worldDir: dir },
-    )
+    const result = await invoke<{
+      manifestPath: string
+      tileCount: number
+      regionCount: number
+      stats: RenderStats
+    }>('render_world', { worldDir: dir })
+    renderStats.value = result.stats
     cacheDir = result.manifestPath.replace(/[/\\]settings\.json$/, '')
     const manifest = await invoke<Manifest>('load_manifest', { manifestPath: result.manifestPath })
     worldName.value = manifest.world_name
     totalTiles.value = manifest.tiles.length
     for (const t of manifest.tiles) tilesByXZ.set(`${t.x},${t.z}`, t)
     phase.value = 'viewing'
+    // Center the camera on the rendered data (worlds often live in negative coords).
+    if (manifest.tiles.length > 0) {
+      let minX = Infinity, maxX = -Infinity
+      let minY = Infinity, maxY = -Infinity
+      let minZ = Infinity, maxZ = -Infinity
+      for (const t of manifest.tiles) {
+        minX = Math.min(minX, t.min[0]); maxX = Math.max(maxX, t.max[0])
+        minY = Math.min(minY, t.min[1]); maxY = Math.max(maxY, t.max[1])
+        minZ = Math.min(minZ, t.min[2]); maxZ = Math.max(maxZ, t.max[2])
+      }
+      const cx = (minX + maxX) / 2
+      const cy = (minY + maxY) / 2
+      const cz = (minZ + maxZ) / 2
+      const span = Math.max(maxX - minX, maxZ - minZ, 64)
+      camera.position.set(cx + span * 0.5, cy + span * 0.6, cz + span * 0.5)
+      orbit.target.set(cx, cy, cz)
+    }
     await invoke('start_watching', { worldDir: dir }).catch(() => {})
   } catch (e) {
     error.value = String(e)
