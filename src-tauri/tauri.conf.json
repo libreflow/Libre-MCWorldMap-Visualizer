@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "bluemap-tauri",
+  "productName": "Libre-MCWorldMap-Visualizer",
   "version": "0.1.0",
-  "identifier": "com.robinsonx.bluemap-tauri",
+  "identifier": "com.libreflow.libre-mcworldmap-visualizer",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "bluemap-tauri",
+        "title": "Libre-MCWorldMap-Visualizer",
         "width": 800,
         "height": 600
       }

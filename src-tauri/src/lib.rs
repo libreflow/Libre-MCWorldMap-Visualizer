@@ -46,31 +46,33 @@ async fn render_world(
         return Err("no region files found (is this a Minecraft world?)".into());
     }
 
-    let out_dir = world_path.join(".bluemap-tauri-cache");
+    let out_dir = world_path.join(".libre-mcworldmap-cache");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     *state.out_dir.lock().await = Some(out_dir.clone());
 
     let renderer = WorldRenderer::new();
     let total = regions.len();
-    let done = AtomicUsize::new(0);
+    let done = std::sync::Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<(String, Vec<TileEntry>)>();
     // mpsc::Sender is !Sync; wrap so the rayon closure can capture it.
     let tx = std::sync::Mutex::new(tx);
 
     // Heavy work off the async runtime, parallelized per region with rayon.
+    // `done` is shared between the render thread and the progress loop below.
+    let done_thread = done.clone();
+    let out_dir_thread = out_dir.clone();
     let handle = std::thread::spawn(move || {
         let all_tiles: Vec<Vec<TileEntry>> = regions
             .par_iter()
             .map(|(rx, rz, path)| {
                 let label = format!("r.{rx}.{rz}");
                 let tiles = renderer
-                    .render_region(path, &out_dir, *rx, *rz)
+                    .render_region(path, &out_dir_thread, *rx, *rz)
                     .unwrap_or_default();
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                done_thread.fetch_add(1, Ordering::Relaxed);
                 if let Ok(tx) = tx.lock() {
                     let _ = tx.send((label, tiles.clone()));
                 }
-                let _ = d;
                 tiles
             })
             .collect();

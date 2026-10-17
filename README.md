@@ -1,6 +1,6 @@
-# bluemap-tauri
+# Libre-MCWorldMap-Visualizer
 
-Cartographe 3D de mondes Minecraft (type BlueMap) construit avec **Tauri 2.0** :
+Cartographe 3D de mondes Minecraft (inspiré de BlueMap) construit avec **Tauri 2.0** :
 le backend Rust lit les fichiers de région Anvil et exporte des tuiles GLB,
 le frontend three.js les affiche dans une carte 3D navigable.
 
@@ -22,7 +22,7 @@ npm run tauri dev
 
 Sélectionnez le dossier d'un monde Minecraft (contenant `region/*.mca`),
 le rendu s'affiche progressivement. Les tuiles sont écrites dans
-`<monde>/.bluemap-tauri-cache/`.
+`<monde>/.libre-mcworldmap-cache/`.
 
 ## État (MVP)
 
