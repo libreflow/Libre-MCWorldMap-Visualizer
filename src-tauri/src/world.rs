@@ -43,13 +43,13 @@ struct PaletteEntryNbt {
     properties: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TileManifest {
     pub world_name: String,
     pub tiles: Vec<TileEntry>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TileEntry {
     pub file: String,
     pub x: i32,
