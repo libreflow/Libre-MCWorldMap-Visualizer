@@ -12,14 +12,10 @@ struct GlbJson {
     #[serde(rename = "bufferViews")]
     buffer_views: Vec<BufferView>,
     accessors: Vec<Accessor>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    images: Option<[Image; 1]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    samplers: Option<[Sampler; 1]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    textures: Option<[Texture; 1]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    materials: Option<[Material; 1]>,
+    images: [Image; 1],
+    samplers: [Sampler; 1],
+    textures: [Texture; 1],
+    materials: [Material; 2],
 }
 
 #[derive(Serialize)]
@@ -40,7 +36,7 @@ struct Node {
 
 #[derive(Serialize)]
 struct Mesh {
-    primitives: [Primitive; 1],
+    primitives: Vec<Primitive>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +53,8 @@ struct Attributes {
     position: usize,
     #[serde(rename = "TEXCOORD_0")]
     texcoord: usize,
+    #[serde(rename = "COLOR_0")]
+    color: usize,
 }
 
 #[derive(Serialize)]
@@ -137,34 +135,55 @@ struct TextureRef {
     index: usize,
 }
 
-/// Minimal glTF 2.0 GLB writer: single textured mesh (POSITION + TEXCOORD_0)
-/// plus an embedded PNG atlas referenced by one NearestFilter material.
+/// One primitive group (vertices + indices) sharing a material.
+pub struct PrimitiveGroup {
+    pub vertices: Vec<f32>,
+    pub indices: Vec<u32>,
+}
+
+/// Minimal glTF 2.0 GLB writer: textured mesh with per-vertex shade colors,
+/// split into an opaque group (material 0, MASK) and a blended group
+/// (material 1, BLEND) for water/ice. Atlas PNG embedded.
 pub struct GlbWriter;
 
 impl GlbWriter {
-    /// Write an interleaved mesh (pos+uv per vertex) as a GLB file, embedding
-    /// `atlas_png` as the base color texture.
+    /// `opaque` and `blended` hold interleaved pos(3)+uv(2)+shade(3) vertices.
     pub fn write(
         path: &std::path::Path,
-        vertices: &[f32],
-        indices: &[u32],
+        opaque: &PrimitiveGroup,
+        blended: &PrimitiveGroup,
         atlas_png: &[u8],
     ) -> std::io::Result<()> {
-        let vertex_count = vertices.len() / 5;
-        let mut positions = Vec::with_capacity(vertex_count * 3);
-        let mut uvs = Vec::with_capacity(vertex_count * 2);
-        for v in vertices.chunks_exact(5) {
-            positions.extend_from_slice(&v[0..3]);
-            uvs.extend_from_slice(&v[3..5]);
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut colors = Vec::new();
+        let mut indices = Vec::new();
+
+        let mut base_vertex = 0usize;
+        let mut ranges: Vec<(usize, usize)> = Vec::new(); // (index offset, count) per group
+        for group in [opaque, blended] {
+            let start = indices.len();
+            for v in group.vertices.chunks_exact(8) {
+                positions.extend_from_slice(&v[0..3]);
+                uvs.extend_from_slice(&v[3..5]);
+                colors.extend_from_slice(&v[5..8]);
+            }
+            for &i in &group.indices {
+                indices.push(i + base_vertex as u32);
+            }
+            ranges.push((start, indices.len() - start));
+            base_vertex += group.vertices.len() / 8;
         }
 
         let pos_bytes = to_le_bytes_f32(&positions);
         let uv_bytes = to_le_bytes_f32(&uvs);
-        let idx_bytes = to_le_bytes_u32(indices);
+        let col_bytes = to_le_bytes_f32(&colors);
+        let idx_bytes = to_le_bytes_u32(&indices);
 
         let pos_offset = 0usize;
         let uv_offset = pos_offset + padded_len(&pos_bytes);
-        let idx_offset = uv_offset + padded_len(&uv_bytes);
+        let col_offset = uv_offset + padded_len(&uv_bytes);
+        let idx_offset = col_offset + padded_len(&col_bytes);
         let png_offset = idx_offset + padded_len(&idx_bytes);
         let bin_len = png_offset + atlas_png.len();
 
@@ -177,6 +196,23 @@ impl GlbWriter {
             }
         }
 
+        let make_primitive = |i: usize| Primitive {
+            attributes: Attributes {
+                position: 0,
+                texcoord: 1,
+                color: 2,
+            },
+            indices: 3,
+            material: i,
+            mode: 4,
+        };
+        let primitives: Vec<Primitive> = ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, count))| *count > 0)
+            .map(|(i, _)| make_primitive(i))
+            .collect();
+
         let json = GlbJson {
             asset: Asset {
                 version: "2.0".into(),
@@ -187,17 +223,7 @@ impl GlbWriter {
                 mesh: 0,
                 name: "chunk".into(),
             }],
-            meshes: [Mesh {
-                primitives: [Primitive {
-                    attributes: Attributes {
-                        position: 0,
-                        texcoord: 1,
-                    },
-                    indices: 2,
-                    material: 0,
-                    mode: 4,
-                }],
-            }],
+            meshes: [Mesh { primitives }],
             buffers: [Buffer {
                 byte_length: bin_len,
             }],
@@ -212,6 +238,12 @@ impl GlbWriter {
                     buffer: 0,
                     byte_offset: uv_offset,
                     byte_length: uv_bytes.len(),
+                    target: Some(34962),
+                },
+                BufferView {
+                    buffer: 0,
+                    byte_offset: col_offset,
+                    byte_length: col_bytes.len(),
                     target: Some(34962),
                 },
                 BufferView {
@@ -246,6 +278,14 @@ impl GlbWriter {
                 },
                 Accessor {
                     buffer_view: 2,
+                    component_type: 5126,
+                    count: colors.len() / 3,
+                    type_: "VEC3".into(),
+                    min: None,
+                    max: None,
+                },
+                Accessor {
+                    buffer_view: 3,
                     component_type: 5125,
                     count: indices.len(),
                     type_: "SCALAR".into(),
@@ -253,30 +293,42 @@ impl GlbWriter {
                     max: None,
                 },
             ],
-            images: Some([Image {
-                buffer_view: 3,
+            images: [Image {
+                buffer_view: 4,
                 mime_type: "image/png".into(),
-            }]),
-            samplers: Some([Sampler {
+            }],
+            samplers: [Sampler {
                 mag_filter: 9728,
                 min_filter: 9984,
                 wrap_s: 33071,
                 wrap_t: 33071,
-            }]),
-            textures: Some([Texture {
+            }],
+            textures: [Texture {
                 sampler: 0,
                 source: 0,
-            }]),
-            materials: Some([Material {
-                name: "atlas".into(),
-                pbr: Pbr {
-                    base_color_texture: TextureRef { index: 0 },
-                    metallic_factor: 0.0,
-                    roughness_factor: 1.0,
+            }],
+            materials: [
+                Material {
+                    name: "atlas".into(),
+                    pbr: Pbr {
+                        base_color_texture: TextureRef { index: 0 },
+                        metallic_factor: 0.0,
+                        roughness_factor: 1.0,
+                    },
+                    alpha_mode: "MASK".into(),
+                    double_sided: true,
                 },
-                alpha_mode: "MASK".into(),
-                double_sided: true,
-            }]),
+                Material {
+                    name: "water".into(),
+                    pbr: Pbr {
+                        base_color_texture: TextureRef { index: 0 },
+                        metallic_factor: 0.0,
+                        roughness_factor: 0.35,
+                    },
+                    alpha_mode: "BLEND".into(),
+                    double_sided: false,
+                },
+            ],
         };
 
         let mut json_bytes = serde_json::to_vec(&json).expect("glTF json is serializable");
@@ -287,6 +339,7 @@ impl GlbWriter {
         let mut bin = Vec::with_capacity(bin_len + 4);
         append_padded(&mut bin, &pos_bytes);
         append_padded(&mut bin, &uv_bytes);
+        append_padded(&mut bin, &col_bytes);
         append_padded(&mut bin, &idx_bytes);
         bin.extend_from_slice(atlas_png);
 

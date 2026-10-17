@@ -1,5 +1,7 @@
-use crate::glb::GlbWriter;
-use crate::mesh::{BlockMapper, ChunkMesh, Direction, face_vertices};
+use crate::glb::{GlbWriter, PrimitiveGroup};
+use crate::mesh::{
+    BlockMapper, ChunkMesh, Direction, ao_corners_generic, dir_shade, face_vertices,
+};
 use crate::resources::Atlas;
 use fastanvil::Region;
 use fastnbt::from_bytes;
@@ -31,7 +33,7 @@ pub struct SectionNbt {
 }
 
 #[derive(Deserialize)]
-struct BlockStatesNbt {
+pub struct BlockStatesNbt {
     palette: Vec<PaletteEntryNbt>,
     data: Option<LongArray>,
 }
@@ -40,7 +42,9 @@ use fastnbt::LongArray;
 
 #[derive(Deserialize)]
 struct PaletteEntryNbt {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     properties: Option<serde_json::Value>,
 }
 
@@ -67,7 +71,9 @@ pub struct WorldRenderer {
 
 /// Bit-pack reader for packed 64-bit long arrays (Minecraft format).
 struct PackedBits<'a> {
+    #[allow(dead_code)]
     data: &'a [i64],
+    #[allow(dead_code)]
     bits: usize,
     entries: Vec<u16>,
 }
@@ -154,13 +160,11 @@ impl WorldRenderer {
 
     fn mesh_chunk(&self, nbt_bytes: &[u8], out_dir: &Path, cx: i32, cz: i32) -> Option<TileEntry> {
         let chunk: ChunkNbt = from_bytes(nbt_bytes).ok()?;
-        let mut mesh = ChunkMesh::default();
-
-        // Section Y -> sections map
-        let _sections: std::collections::HashMap<i8, &SectionNbt> =
-            chunk.sections.iter().map(|s| (s.y, s)).collect();
+        let mut opaque = ChunkMesh::default();
+        let mut blended = ChunkMesh::default();
 
         let world = BlockWorld::from_chunk(&chunk);
+        let surface = world.surface_heights();
 
         for y in WORLD_MIN_Y..(WORLD_MIN_Y + WORLD_HEIGHT as i32) {
             for z in 0..16 {
@@ -178,6 +182,14 @@ impl WorldRenderer {
                     let wx = cx * 16 + x as i32;
                     let wz = cz * 16 + z as i32;
 
+                    // Darken blocks far below the surface (caves, overhangs).
+                    let depth = (surface[(z * 16 + x) as usize] - y).max(0) as f32;
+                    let light = if info.blend {
+                        1.0
+                    } else {
+                        (1.0 - depth * 0.045).max(0.35)
+                    };
+
                     for dir in Direction::ALL {
                         let [dx, dy, dz] = dir.offset();
                         let nb = world.block(x + dx, y + dy, z + dz);
@@ -185,28 +197,52 @@ impl WorldRenderer {
                             None => true,
                             Some(idx) => world.is_transparent(idx, &self.mapper),
                         };
-                        if nb_transparent {
-                            let face_idx = dir.face_idx() / 4;
-                            let uv = self.atlas_rect(info.tiles[face_idx]);
-                            let verts = face_vertices(wx, y, wz, dir, uv);
-                            mesh.extend(&verts);
+                        if !nb_transparent {
+                            continue;
+                        }
+                        let face_idx = dir.face_idx() / 4;
+                        let uv = self.mapper.rect(info.tiles[face_idx]);
+                        let base = dir_shade(dir) * light;
+                        let ao = world.ao_corners(&self.mapper, x, y, z, dir);
+                        let shade = ao.map(|a| (base * a).clamp(0.0, 1.0));
+                        let verts = face_vertices(wx, y, wz, dir, uv, shade);
+                        if info.blend {
+                            blended.extend(&verts);
+                        } else {
+                            opaque.extend(&verts);
                         }
                     }
                 }
             }
         }
 
-        if mesh.vertices.is_empty() {
+        if opaque.vertices.is_empty() && blended.vertices.is_empty() {
             return None;
         }
 
         let file_name = format!("chunk_{cx}_{cz}.glb");
         let path = out_dir.join(&file_name);
-        GlbWriter::write(&path, &mesh.vertices, &mesh.indices, &self.atlas_png).ok()?;
+        GlbWriter::write(
+            &path,
+            &PrimitiveGroup {
+                vertices: opaque.vertices.clone(),
+                indices: opaque.indices.clone(),
+            },
+            &PrimitiveGroup {
+                vertices: blended.vertices.clone(),
+                indices: blended.indices.clone(),
+            },
+            &self.atlas_png,
+        )
+        .ok()?;
 
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
-        for v in mesh.vertices.chunks_exact(5) {
+        for v in opaque
+            .vertices
+            .chunks_exact(8)
+            .chain(blended.vertices.chunks_exact(8))
+        {
             for i in 0..3 {
                 min[i] = min[i].min(v[i]);
                 max[i] = max[i].max(v[i]);
@@ -220,10 +256,6 @@ impl WorldRenderer {
             min,
             max,
         })
-    }
-
-    fn atlas_rect(&self, tile_idx: usize) -> [f32; 4] {
-        self.mapper.rect(tile_idx)
     }
 }
 
@@ -321,6 +353,43 @@ impl BlockWorld {
             self.palette_name(idx),
             Some("minecraft:air") | Some("minecraft:cave_air") | Some("minecraft:void_air")
         )
+    }
+
+    /// Highest non-air block per column, for cave darkening.
+    pub fn surface_heights(&self) -> Vec<i32> {
+        let mut out = vec![WORLD_MIN_Y; 16 * 16];
+        for z in 0..16 {
+            for x in 0..16 {
+                'col: for y in (WORLD_MIN_Y + WORLD_HEIGHT as i32 - 1)..WORLD_MIN_Y {
+                    let y = y as i32;
+                    if let Some(idx) = self.block(x, y, z) {
+                        if !self.is_air(idx) {
+                            out[(z * 16 + x) as usize] = y;
+                            break 'col;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Per-corner ambient occlusion for one face (0fps algorithm).
+    pub fn ao_corners(
+        &self,
+        mapper: &BlockMapper,
+        x: i32,
+        y: i32,
+        z: i32,
+        dir: Direction,
+    ) -> [f32; 4] {
+        let solid = |sx: i32, sy: i32, sz: i32| -> bool {
+            match self.block(sx, sy, sz) {
+                None => false,
+                Some(idx) => !self.is_transparent(idx, mapper) && !self.is_air(idx),
+            }
+        };
+        ao_corners_generic(x, y, z, dir, &solid)
     }
 
     fn is_transparent(&self, idx: u16, mapper: &BlockMapper) -> bool {
