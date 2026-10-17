@@ -23,7 +23,7 @@ impl ChunkMesh {
 }
 
 /// Face texture + render mapping for a block state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlockInfo {
     /// texture tile index per face direction (E, W, U, D, S, N)
     pub tiles: [usize; 6],
@@ -31,6 +31,17 @@ pub struct BlockInfo {
     pub transparent: bool,
     /// rendered with alpha blending (water, ice) instead of alpha cutout
     pub blend: bool,
+    /// non-cubic geometry (stairs/slabs); None = plain cube
+    pub shape: Option<usize>,
+}
+
+/// Sub-box of a non-cubic model in 0..1 block space, with per-face tiles.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShapeBox {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    /// resolved tile index per face (missing tile where None)
+    pub tiles: [usize; 6],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +59,14 @@ pub struct BlockMapper {
     /// uv rect per tile index (empty when no atlas is available)
     #[allow(dead_code)]
     rects: Vec<UvRect>,
+    /// texture name -> tile index, including climate variants ("name#plains")
+    tile_index: HashMap<String, usize>,
+    /// tile index -> base texture name (for climate variant lookup)
+    tile_names: HashMap<usize, String>,
+    /// shape table: index -> boxes (stairs, slabs...)
+    shapes: Vec<Vec<ShapeBox>>,
+    /// block name -> shape index
+    shape_of: HashMap<String, usize>,
 }
 
 impl BlockMapper {
@@ -74,10 +93,35 @@ impl BlockMapper {
             );
         }
         let rects = atlas.all_rects().to_vec();
+        let tile_index = atlas.tile_index().clone();
+        let mut shapes: Vec<Vec<ShapeBox>> = Vec::new();
+        let mut shape_of: HashMap<String, usize> = HashMap::new();
+        let missing_shape = atlas.missing_idx;
+        for (block, boxes) in atlas.custom_shapes() {
+            let resolved: Vec<ShapeBox> = boxes
+                .iter()
+                .map(|b| ShapeBox {
+                    from: b.from.map(|v| v / 16.0),
+                    to: b.to.map(|v| v / 16.0),
+                    tiles: b.tiles.map(|t| t.unwrap_or(missing_shape)),
+                })
+                .collect();
+            shape_of.insert(block.clone(), shapes.len());
+            shapes.push(resolved);
+        }
+        let tile_names = tile_index
+            .iter()
+            .filter(|(k, _)| !k.contains('#'))
+            .map(|(k, v)| (*v, k.clone()))
+            .collect();
         Self {
             palette,
             missing,
             rects,
+            tile_index,
+            tile_names,
+            shapes,
+            shape_of,
         }
     }
 
@@ -87,6 +131,10 @@ impl BlockMapper {
             palette: HashMap::new(),
             missing: 0,
             rects: vec![[0.0, 0.0, 1.0, 1.0]],
+            tile_index: HashMap::new(),
+            tile_names: HashMap::new(),
+            shapes: Vec::new(),
+            shape_of: HashMap::new(),
         }
     }
 
@@ -97,21 +145,38 @@ impl BlockMapper {
             .unwrap_or([0.0, 0.0, 1.0, 1.0])
     }
 
-    pub fn lookup(&self, block_state: &str) -> BlockInfo {
+    pub fn lookup(&self, block_state: &str, climate: &str) -> BlockInfo {
         let cleaned = block_state.trim_start_matches("minecraft:");
         let base = cleaned.split('[').next().unwrap_or(cleaned);
         match self.palette.get(base) {
-            Some(e) => BlockInfo {
-                tiles: e.tiles,
-                transparent: e.transparent,
-                blend: e.blend,
-            },
+            Some(e) => {
+                let tiles = e.tiles.map(|t| {
+                    if let Some(name) = self.tile_names.get(&t) {
+                        if let Some(&v) = self.tile_index.get(&format!("{name}#{climate}")) {
+                            return v;
+                        }
+                    }
+                    t
+                });
+                BlockInfo {
+                    tiles,
+                    transparent: e.transparent,
+                    blend: e.blend,
+                    shape: self.shape_of.get(base).copied(),
+                }
+            }
             None => BlockInfo {
                 tiles: [self.missing; 6],
                 transparent: false,
                 blend: false,
+                shape: None,
             },
         }
+    }
+
+    /// Boxes of a non-cubic shape (stairs/slabs).
+    pub fn shape_boxes(&self, shape: usize) -> &[ShapeBox] {
+        self.shapes.get(shape).map(|v| v.as_slice()).unwrap_or(&[])
     }
 }
 
