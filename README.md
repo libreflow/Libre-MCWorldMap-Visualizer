@@ -28,6 +28,21 @@ le rendu s'affiche progressivement. Les tuiles sont écrites dans
 
 - ✅ Parsing Anvil + meshing + export GLB par chunk (validé sur une région de test)
 - ✅ Rendu 3D avec lazy loading + contrôles orbital/vol
+- ✅ Textures réelles : atlas construit depuis votre jar Minecraft ou un resource pack (`.jar`/`.zip` ou dossier), UVs par face (top/side/bottom), `NearestFilter` pixelisé — voir « Textures » ci-dessous
 - ⏳ V1 : multi-threadé complet + UI de progression fine
-- ⏳ V2 : live update (watcher branché), LOD, Nether/End, resource packs
+- ⏳ V2 : live update (watcher branché), LOD, Nether/End, modèles non-cubiques (escaliers, dalles), animations d'eau
 - ⏳ V3 : marqueurs, export statique partageable
+
+## Textures
+
+Les textures de Minecraft sont copyrightées (Mojang) : l'app ne les embarque pas et ne les
+redistribue pas. Elle les lit localement, dans cet ordre de priorité :
+
+1. Le pack de textures choisi via « Pack de textures » (`.jar`/`.zip` ou dossier de resource pack)
+2. Le jar vanilla détecté automatiquement (`~/.minecraft/versions/<v>/<v>.jar` ou `%APPDATA%\.minecraft\...`)
+3. Aucune source trouvée → tuile grise de secours (le rendu reste fonctionnel)
+
+Le pipeline : PNG de `textures/block/` → atlas unique (tuiles 16×16, textures animées tronquées
+à leur première frame) → mapping `blockstates/*.json` → modèles → texture par face (haut/côtés/bas).
+L'atlas est embarqué dans chaque GLB (`TEXCOORD_0` + PNG dans le binaire glTF). L'atlas est aussi
+écrit dans `<monde>/.libre-mcworldmap-cache/atlas.png` à des fins d'inspection.
