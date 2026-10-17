@@ -30,6 +30,8 @@ pub struct SectionNbt {
     pub y: i8,
     #[serde(rename = "block_states")]
     pub block_states: Option<BlockStatesNbt>,
+    #[serde(rename = "BlockLight", default)]
+    pub block_light: Option<LongArray>,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +204,15 @@ impl WorldRenderer {
                         }
                         let face_idx = dir.face_idx() / 4;
                         let uv = self.mapper.rect(info.tiles[face_idx]);
-                        let base = dir_shade(dir) * light;
+                        // Block light from the cell this face looks into.
+                        let bl = world.light_at(x + dx, y + dy, z + dz) as f32;
+                        let block_light = bl / 15.0;
+                        let face_light = if info.blend {
+                            light
+                        } else {
+                            (light + block_light * (1.0 - light)).min(1.0)
+                        };
+                        let base = dir_shade(dir) * face_light;
                         let ao = world.ao_corners(&self.mapper, x, y, z, dir);
                         let shade = ao.map(|a| (base * a).clamp(0.0, 1.0));
                         let verts = face_vertices(wx, y, wz, dir, uv, shade);
@@ -264,6 +274,8 @@ struct BlockWorld {
     palette: Vec<String>,
     /// Index into palette, per block in the chunk (y-major relative to WORLD_MIN_Y).
     blocks: Vec<u16>,
+    /// Block light level (0-15) per block, 0 where absent.
+    light: Vec<u8>,
 }
 
 impl BlockWorld {
@@ -273,6 +285,24 @@ impl BlockWorld {
         let mut palette_map: std::collections::HashMap<String, u16> =
             std::collections::HashMap::new();
         palette_map.insert("minecraft:air".into(), 0);
+
+        let mut light = vec![0u8; 16 * 16 * WORLD_HEIGHT];
+
+        for section in &chunk.sections {
+            if let Some(bl) = &section.block_light {
+                let sec_min_y = section.y as i32 * 16;
+                for i in 0..4096usize {
+                    let y = (i >> 8) & 15;
+                    let z = (i >> 4) & 15;
+                    let x = i & 15;
+                    let wy = sec_min_y + y as i32;
+                    if wy < WORLD_MIN_Y || wy >= WORLD_MIN_Y + WORLD_HEIGHT as i32 {
+                        continue;
+                    }
+                    light[((wy - WORLD_MIN_Y) as usize * 16 + z) * 16 + x] = unpack_nibble(bl, i);
+                }
+            }
+        }
 
         for section in &chunk.sections {
             let Some(bs) = &section.block_states else {
@@ -330,7 +360,22 @@ impl BlockWorld {
                 }
             }
         }
-        Self { palette, blocks }
+        Self {
+            palette,
+            blocks,
+            light,
+        }
+    }
+
+    /// Block light level at a position (0-15).
+    fn light_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        if x < 0 || x > 15 || z < 0 || z > 15 {
+            return 0;
+        }
+        if y < WORLD_MIN_Y || y >= WORLD_MIN_Y + WORLD_HEIGHT as i32 {
+            return 0;
+        }
+        self.light[((y - WORLD_MIN_Y) as usize * 16 + z as usize) * 16 + x as usize]
     }
 
     fn block(&self, x: i32, y: i32, z: i32) -> Option<u16> {
@@ -401,6 +446,16 @@ impl BlockWorld {
             None => true,
         }
     }
+}
+
+/// Unpack the i-th 4-bit value from a packed long array (Minecraft light format).
+fn unpack_nibble(arr: &LongArray, i: usize) -> u8 {
+    let data: &[i64] = arr;
+    let long_idx = i / 16;
+    let offset = (i % 16) * 4;
+    data.get(long_idx)
+        .map(|l| ((*l as u64 >> offset) & 0xF) as u8)
+        .unwrap_or(0)
 }
 
 fn bit_width(max: u64) -> usize {
