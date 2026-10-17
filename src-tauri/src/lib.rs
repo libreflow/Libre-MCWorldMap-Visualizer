@@ -5,7 +5,7 @@ mod world;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
@@ -14,7 +14,7 @@ use world::{RenderStats, TileEntry, TileManifest, WorldRenderer};
 #[derive(Default)]
 pub struct RenderState {
     out_dir: Mutex<Option<PathBuf>>,
-    stop_watcher: Mutex<Option<std::sync::Arc<AtomicUsize>>>,
+    stop_watcher: Mutex<Option<std::sync::Arc<AtomicBool>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -204,7 +204,7 @@ async fn start_watching(
         }
     };
 
-    let stop = std::sync::Arc::new(AtomicUsize::new(0));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
     *state.stop_watcher.lock().await = Some(stop.clone());
 
     std::thread::spawn(move || {
@@ -230,7 +230,7 @@ async fn start_watching(
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if stop.load(Ordering::Relaxed) != 0 {
+                    if stop.load(Ordering::Relaxed) {
                         break;
                     }
                 }
