@@ -140,6 +140,41 @@ async fn read_glb(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| format!("failed to read {path}: {e}"))
 }
 
+/// Format diagnostics: dump the raw NBT structure of the first readable
+/// chunk in the first region of the given world. Returns a text report.
+#[tauri::command]
+async fn dump_chunk(world_dir: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let world_path = PathBuf::from(&world_dir);
+        let regions = world::find_regions(&world_path)?;
+        let (rx, rz, ref region_path) = regions[0];
+        let mut region = world::open_region(region_path)?;
+        for lz in 0..32 {
+            for lx in 0..32 {
+                match region.read_chunk(lx, lz) {
+                    Ok(Some(data)) => {
+                        let header = format!(
+                            "region r.{rx}.{rz}, chunk {lx},{lz} (world chunk {},{}), {} bytes\n",
+                            rx * 32 + lx,
+                            rz * 32 + lz,
+                            data.len()
+                        );
+                        let dump = world::dump_chunk_top_level(&data)?;
+                        return Ok(format!("{header}{dump}"));
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        return Err(format!("region read error at {lx},{lz}: {e}"));
+                    }
+                }
+            }
+        }
+        Err("region contains no readable chunks".into())
+    })
+    .await
+    .map_err(|e| format!("dump task failed: {e}"))?
+}
+
 #[tauri::command]
 async fn start_watching(
     app: AppHandle,
@@ -195,6 +230,7 @@ pub fn run() {
             render_world,
             load_manifest,
             read_glb,
+            dump_chunk,
             start_watching
         ])
         .run(tauri::generate_context!())

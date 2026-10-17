@@ -327,7 +327,7 @@ fn bit_width(max: u64) -> usize {
     (64 - max.leading_zeros() as usize).max(1)
 }
 
-fn open_region(path: &Path) -> Result<Region<File>, String> {
+pub fn open_region(path: &Path) -> Result<Region<File>, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {path:?}: {e}"))?;
     Region::from_stream(file).map_err(|e| format!("invalid region file {path:?}: {e}"))
 }
@@ -413,4 +413,222 @@ fn parse_region_name(name: &str) -> Option<(i32, i32)> {
     let rx = parts.next()?.parse().ok()?;
     let rz = parts.next()?.parse().ok()?;
     Some((rx, rz))
+}
+
+// ---------------------------------------------------------------------------
+// Chunk format diagnostics (for adapting the parser to new Minecraft versions)
+// ---------------------------------------------------------------------------
+
+/// A raw NBT tag walker: reports field names and exact tag types without
+/// assuming any schema. Used by the dump_chunk command to diagnose format
+/// changes in newly released Minecraft versions.
+pub fn dump_chunk_top_level(nbt_bytes: &[u8]) -> Result<String, String> {
+    let mut out = String::new();
+    let mut r = Reader { data: nbt_bytes, pos: 0 };
+    // Root: TAG_Compound (0x0A) + name
+    let root_tag = r.u8().map_err(|e| e.to_string())?;
+    if root_tag != 0x0A {
+        return Err(format!("root tag is 0x{root_tag:02X}, expected compound"));
+    }
+    let _root_name = r.string().map_err(|e| e.to_string())?;
+    loop {
+        let tag = r.u8().map_err(|e| e.to_string())?;
+        if tag == 0x00 {
+            break;
+        }
+        let name = r.string().map_err(|e| e.to_string())?;
+        let desc = describe_payload(&mut r, tag, 0).map_err(|e| e.to_string())?;
+        out.push_str(&format!("  {name}: {}\n", desc));
+    }
+    Ok(out)
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn u8(&mut self) -> Result<u8, String> {
+        self.take(1).map(|b| b[0])
+    }
+    fn i32(&mut self) -> Result<i32, String> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn string(&mut self) -> Result<String, String> {
+        let b = self.take(2)?;
+        let len = u16::from_be_bytes([b[0], b[1]]) as usize;
+        let b = self.take(len)?;
+        String::from_utf8(b.to_vec()).map_err(|e| e.to_string())
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.pos + n > self.data.len() {
+            return Err("unexpected end of NBT data".into());
+        }
+        let b = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(b)
+    }
+}
+
+fn tag_name(tag: u8) -> &'static str {
+    match tag {
+        0x00 => "TAG_End",
+        0x01 => "TAG_Byte",
+        0x02 => "TAG_Short",
+        0x03 => "TAG_Int",
+        0x04 => "TAG_Long",
+        0x05 => "TAG_Float",
+        0x06 => "TAG_Double",
+        0x07 => "TAG_Byte_Array",
+        0x08 => "TAG_String",
+        0x09 => "TAG_List",
+        0x0A => "TAG_Compound",
+        0x0B => "TAG_Int_Array",
+        0x0C => "TAG_Long_Array",
+        _ => "TAG_Unknown",
+    }
+}
+
+/// Walk one payload (after tag byte + name) and return a human-readable
+/// description. Recurses with a depth limit to keep the dump readable.
+fn describe_payload(r: &mut Reader, tag: u8, depth: usize) -> Result<String, String> {
+    const MAX_DEPTH: usize = 3;
+    match tag {
+        0x01 => Ok(format!("TAG_Byte = {}", r.u8()? as i8)),
+        0x02 => {
+            let b = r.take(2)?;
+            Ok(format!("TAG_Short = {}", i16::from_be_bytes([b[0], b[1]])))
+        }
+        0x03 => Ok(format!("TAG_Int = {}", r.i32()?)),
+        0x04 => {
+            let b = r.take(8)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(b);
+            Ok(format!("TAG_Long = {}", i64::from_be_bytes(a)))
+        }
+        0x05 => {
+            let b = r.take(4)?;
+            let mut a = [0u8; 4];
+            a.copy_from_slice(b);
+            Ok(format!("TAG_Float = {}", f32::from_be_bytes(a)))
+        }
+        0x06 => {
+            let b = r.take(8)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(b);
+            Ok(format!("TAG_Double = {}", f64::from_be_bytes(a)))
+        }
+        0x07 => {
+            let len = r.i32()? as usize;
+            let bytes = r.take(len)?;
+            let head: Vec<String> = bytes.iter().take(16).map(|b| format!("{b:02X}")).collect();
+            Ok(format!(
+                "TAG_Byte_Array(len={len}) first bytes: {}",
+                head.join(" ")
+            ))
+        }
+        0x08 => {
+            let s = r.string()?;
+            if s.len() > 64 {
+                Ok(format!("TAG_String = {:?}…", &s[..64]))
+            } else {
+                Ok(format!("TAG_String = {s:?}"))
+            }
+        }
+        0x09 => {
+            let elem_tag = r.u8()?;
+            let count = r.i32()?;
+            if depth >= MAX_DEPTH {
+                // Skip payloads we won't describe
+                skip_list_payloads(r, elem_tag, count as usize)?;
+                return Ok(format!("TAG_List<{}> x{count}", tag_name(elem_tag)));
+            }
+            let shown = count.min(3) as usize;
+            let mut descs = Vec::new();
+            for _ in 0..shown {
+                descs.push(describe_payload(r, elem_tag, depth + 1)?);
+            }
+            // Skip the rest
+            skip_list_payloads(r, elem_tag, count as usize - shown)?;
+            Ok(format!("TAG_List<{}> x{count} [{}]", tag_name(elem_tag), descs.join("; ")))
+        }
+        0x0A => {
+            if depth >= MAX_DEPTH {
+                skip_compound(r)?;
+                return Ok("TAG_Compound {…}".to_string());
+            }
+            let mut descs = Vec::new();
+            loop {
+                let t = r.u8()?;
+                if t == 0x00 {
+                    break;
+                }
+                let name = r.string()?;
+                let d = describe_payload(r, t, depth + 1)?;
+                descs.push(format!("{name}: {d}"));
+            }
+            Ok(format!("TAG_Compound {{ {} }}", descs.join(", ")))
+        }
+        0x0B => {
+            let len = r.i32()?;
+            r.take(len as usize * 4)?;
+            Ok(format!("TAG_Int_Array(len={len})"))
+        }
+        0x0C => {
+            let len = r.i32()?;
+            r.take(len as usize * 8)?;
+            Ok(format!("TAG_Long_Array(len={len})"))
+        }
+        _ => Err(format!("unknown tag 0x{tag:02X}")),
+    }
+}
+
+fn skip_list_payloads(r: &mut Reader, elem_tag: u8, count: usize) -> Result<(), String> {
+    for _ in 0..count {
+        skip_payload(r, elem_tag)?;
+    }
+    Ok(())
+}
+
+fn skip_compound(r: &mut Reader) -> Result<(), String> {
+    loop {
+        let t = r.u8()?;
+        if t == 0x00 {
+            return Ok(());
+        }
+        let _name = r.string()?;
+        skip_payload(r, t)?;
+    }
+}
+
+fn skip_payload(r: &mut Reader, tag: u8) -> Result<(), String> {
+    match tag {
+        0x01 => r.take(1).map(|_| ()),
+        0x02 => r.take(2).map(|_| ()),
+        0x03 => r.take(4).map(|_| ()),
+        0x04 | 0x06 => r.take(8).map(|_| ()),
+        0x05 => r.take(4).map(|_| ()),
+        0x07 => {
+            let len = r.i32()? as usize;
+            r.take(len).map(|_| ())
+        }
+        0x08 => r.string().map(|_| ()),
+        0x09 => {
+            let elem_tag = r.u8()?;
+            let count = r.i32()? as usize;
+            skip_list_payloads(r, elem_tag, count)
+        }
+        0x0A => skip_compound(r),
+        0x0B => {
+            let len = r.i32()? as usize;
+            r.take(len * 4).map(|_| ())
+        }
+        0x0C => {
+            let len = r.i32()? as usize;
+            r.take(len * 8).map(|_| ())
+        }
+        _ => Err(format!("unknown tag 0x{tag:02X} in skip")),
+    }
 }

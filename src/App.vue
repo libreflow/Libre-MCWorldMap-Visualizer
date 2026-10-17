@@ -20,10 +20,14 @@
     <div v-else class="hud">
       <div class="hud-top">
         <span class="title">{{ worldName }} — {{ loadedTiles }} / {{ totalTiles }} tuiles</span>
-        <button class="small" @click="toggleControls">{{ flyMode ? 'Mode orbital' : 'Mode vol libre' }}</button>
+        <div class="hud-actions">
+          <button class="small" @click="toggleControls">{{ flyMode ? 'Mode orbital' : 'Mode vol libre' }}</button>
+          <button class="small" :disabled="busy" @click="diagnoseFormat">Diagnostiquer le format</button>
+        </div>
       </div>
       <div class="hud-bottom">
         <span>Clic gauche : orbite · Molette : zoom · Clic droit : pan</span>
+        <pre v-if="dumpReport" class="dump">{{ dumpReport }}</pre>
         <span v-if="renderStats">chunks : {{ renderStats.chunksRead }} lus, {{ renderStats.chunksParsed }} parsés, {{ renderStats.chunksEmpty }} vides, {{ renderStats.chunksFailed }} échoués</span>
         <span v-if="renderStats?.parseErrorSample" class="error">{{ renderStats.parseErrorSample }}</span>
         <span v-if="flyMode">ZQSD/WASD + souris pour voler</span>
@@ -75,6 +79,21 @@ const totalTiles = ref(0)
 const loadedTiles = ref(0)
 const flyMode = ref(false)
 const renderStats = ref<RenderStats | null>(null)
+const dumpReport = ref('')
+
+async function diagnoseFormat() {
+  busy.value = true
+  error.value = ''
+  try {
+    const dir = await open({ directory: true, multiple: false, title: 'Dossier du monde Minecraft' })
+    if (!dir || typeof dir !== 'string') return
+    dumpReport.value = await invoke<string>('dump_chunk', { worldDir: dir })
+  } catch (e) {
+    error.value = String(e)
+  } finally {
+    busy.value = false
+  }
+}
 
 const progressPct = computed(() => (total.value === 0 ? 0 : Math.round((done.value / total.value) * 100)))
 
@@ -396,6 +415,25 @@ onBeforeUnmount(() => {
   background: rgba(15, 20, 30, 0.6);
   padding: 6px 12px;
   border-radius: 8px;
+}
+.hud-actions {
+  display: flex;
+  gap: 8px;
+}
+pre.dump {
+  position: absolute;
+  bottom: 70px;
+  left: 12px;
+  max-width: 90%;
+  max-height: 40vh;
+  overflow: auto;
+  background: rgba(10, 14, 20, 0.85);
+  color: #9ad;
+  font-size: 11px;
+  padding: 10px;
+  border-radius: 8px;
+  pointer-events: auto;
+  white-space: pre-wrap;
 }
 button.small {
   pointer-events: auto;
