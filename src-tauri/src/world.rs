@@ -308,10 +308,18 @@ pub fn find_regions(world_dir: &Path) -> Result<Vec<(i32, i32, PathBuf)>, String
     }
     let mut out = Vec::new();
     let mut searched = Vec::new();
+    // Legacy layout: <world>/region/*.mca (single dimension, pre-1.21-style saves).
     collect_regions(&world_dir.join("region"), &mut out);
     searched.push(world_dir.join("region"));
     if out.is_empty() {
-        // Recursive search for any directory containing .mca files.
+        // Newer layouts: regions live under <world>/dimensions/<ns>/<dim>/region/.
+        // Prefer the Overworld; other dimensions would overlap at the same coordinates.
+        let overworld = world_dir.join("dimensions/minecraft/overworld/region");
+        collect_regions(&overworld, &mut out);
+        searched.push(overworld);
+    }
+    if out.is_empty() {
+        // Fallback: recursive search for any .mca files anywhere in the world folder.
         collect_regions_recursive(world_dir, 0, &mut out, &mut searched);
     }
     if out.is_empty() {
