@@ -1,7 +1,33 @@
-# Tauri + Vue + TypeScript
+# bluemap-tauri
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+Cartographe 3D de mondes Minecraft (type BlueMap) construit avec **Tauri 2.0** :
+le backend Rust lit les fichiers de région Anvil et exporte des tuiles GLB,
+le frontend three.js les affiche dans une carte 3D navigable.
 
-## Recommended IDE Setup
+## Architecture
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- **Backend Rust** (`src-tauri/src/`)
+  - `world.rs` — parsing Anvil (`fastanvil`/`fastnbt`), meshing par chunk avec face culling, manifest `settings.json`
+  - `mesh.rs` — mapping block states → cubes colorés (palette minimaliste) + éclairage par face (style Minecraft)
+  - `glb.rs` — export glTF 2.0 binaire (GLB) sans dépendance externe
+  - `lib.rs` — commandes Tauri (`render_world`, `load_manifest`, `read_glb`, `start_watching`), parallélisation `rayon`, progression via events, watcher `notify` sur `region/`
+- **Frontend** (`src/`) — Vue 3 + three.js : GLTFLoader, lazy loading des tuiles autour de la caméra, OrbitControls + mode vol libre (PointerLockControls), fog + skybox
+
+## Développement
+
+```bash
+npm install
+npm run tauri dev
+```
+
+Sélectionnez le dossier d'un monde Minecraft (contenant `region/*.mca`),
+le rendu s'affiche progressivement. Les tuiles sont écrites dans
+`<monde>/.bluemap-tauri-cache/`.
+
+## État (MVP)
+
+- ✅ Parsing Anvil + meshing + export GLB par chunk (validé sur une région de test)
+- ✅ Rendu 3D avec lazy loading + contrôles orbital/vol
+- ⏳ V1 : multi-threadé complet + UI de progression fine
+- ⏳ V2 : live update (watcher branché), LOD, Nether/End, resource packs
+- ⏳ V3 : marqueurs, export statique partageable

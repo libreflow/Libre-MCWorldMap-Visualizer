@@ -1,160 +1,359 @@
-<script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-
-const greetMsg = ref("");
-const name = ref("");
-
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
-}
-</script>
-
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+  <div class="app">
+    <div ref="canvasHost" class="canvas-host"></div>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
+    <div v-if="phase === 'idle'" class="overlay panel">
+      <h1>BlueMap-like — Tauri</h1>
+      <p>Sélectionnez un dossier de monde Minecraft (contenant <code>region/</code>).</p>
+      <button :disabled="busy" @click="pickWorld">Ouvrir un monde…</button>
+      <p v-if="error" class="error">{{ error }}</p>
     </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
 
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
-  </main>
+    <div v-else-if="phase === 'rendering'" class="overlay panel">
+      <h2>Rendu en cours…</h2>
+      <div class="progress">
+        <div class="bar" :style="{ width: progressPct + '%' }"></div>
+      </div>
+      <p>{{ done }} / {{ total }} régions — {{ currentRegion }}</p>
+    </div>
+
+    <div v-else class="hud">
+      <div class="hud-top">
+        <span class="title">{{ worldName }} — {{ loadedTiles }} / {{ totalTiles }} tuiles</span>
+        <button class="small" @click="toggleControls">{{ flyMode ? 'Mode orbital' : 'Mode vol libre' }}</button>
+      </div>
+      <div class="hud-bottom">
+        <span>Clic gauche : orbite · Molette : zoom · Clic droit : pan</span>
+        <span v-if="flyMode">ZQSD/WASD + souris pour voler</span>
+      </div>
+    </div>
+  </div>
 </template>
 
+<script setup lang="ts">
+import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import * as THREE from 'three'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { open } from '@tauri-apps/plugin-dialog'
+
+interface TileEntry {
+  file: string
+  x: number
+  z: number
+  min: [number, number, number]
+  max: [number, number, number]
+}
+
+interface Manifest {
+  world_name: string
+  tiles: TileEntry[]
+}
+
+const canvasHost = ref<HTMLDivElement | null>(null)
+const phase = ref<'idle' | 'rendering' | 'viewing'>('idle')
+const busy = ref(false)
+const error = ref('')
+const done = ref(0)
+const total = ref(0)
+const currentRegion = ref('')
+const worldName = ref('')
+const totalTiles = ref(0)
+const loadedTiles = ref(0)
+const flyMode = ref(false)
+
+const progressPct = computed(() => (total.value === 0 ? 0 : Math.round((done.value / total.value) * 100)))
+
+let renderer: THREE.WebGLRenderer | null = null
+let scene: THREE.Scene
+let camera: THREE.PerspectiveCamera
+let orbit: OrbitControls
+let fly: PointerLockControls
+let raf = 0
+let cacheDir = ''
+const gltfLoader = new GLTFLoader()
+const loaded = new Set<string>()
+const loading = new Set<string>()
+const tilesByXZ = new Map<string, TileEntry>()
+let unlistenFns: (() => void)[] = []
+
+const VIEW_RADIUS_CHUNKS = 12
+
+async function pickWorld() {
+  busy.value = true
+  error.value = ''
+  try {
+    const dir = await open({ directory: true, multiple: false, title: 'Dossier du monde Minecraft' })
+    if (!dir || typeof dir !== 'string') return
+    phase.value = 'rendering'
+    const result = await invoke<{ manifestPath: string; tileCount: number; regionCount: number }>(
+      'render_world',
+      { worldDir: dir },
+    )
+    cacheDir = result.manifestPath.replace(/[/\\]settings\.json$/, '')
+    const manifest = await invoke<Manifest>('load_manifest', { manifestPath: result.manifestPath })
+    worldName.value = manifest.world_name
+    totalTiles.value = manifest.tiles.length
+    for (const t of manifest.tiles) tilesByXZ.set(`${t.x},${t.z}`, t)
+    phase.value = 'viewing'
+    await invoke('start_watching', { worldDir: dir }).catch(() => {})
+  } catch (e) {
+    error.value = String(e)
+    phase.value = 'idle'
+  } finally {
+    busy.value = false
+  }
+}
+
+function tileVisible(t: TileEntry, camX: number, camZ: number): boolean {
+  const centerX = (t.min[0] + t.max[0]) / 2
+  const centerZ = (t.min[2] + t.max[2]) / 2
+  const dx = (centerX - camX) / 16
+  const dz = (centerZ - camZ) / 16
+  return dx * dx + dz * dz <= VIEW_RADIUS_CHUNKS * VIEW_RADIUS_CHUNKS
+}
+
+async function loadTile(t: TileEntry) {
+  const key = `${t.x},${t.z}`
+  if (loaded.has(key) || loading.has(key)) return
+  loading.add(key)
+  try {
+    const bytes = await invoke<number[]>('read_glb', { path: `${cacheDir}/${t.file}` })
+    const buf = new Uint8Array(bytes).buffer
+    const gltf = await gltfLoader.parseAsync(buf, '')
+    scene.add(gltf.scene)
+    loaded.add(key)
+    loadedTiles.value = loaded.size
+  } catch {
+    // tile failed to load; skip silently
+  } finally {
+    loading.delete(key)
+  }
+}
+
+function updateVisibleTiles() {
+  const camX = camera.position.x
+  const camZ = camera.position.z
+  for (const t of tilesByXZ.values()) {
+    if (tileVisible(t, camX, camZ)) void loadTile(t)
+  }
+}
+
+function toggleControls() {
+  flyMode.value = !flyMode.value
+  if (flyMode.value) {
+    orbit.enabled = false
+    fly.lock()
+  } else {
+    fly.unlock()
+    orbit.enabled = true
+  }
+}
+
+const flyKeys = new Set<string>()
+function onKeyDown(e: KeyboardEvent) {
+  flyKeys.add(e.code)
+}
+function onKeyUp(e: KeyboardEvent) {
+  flyKeys.delete(e.code)
+}
+
+function animate() {
+  raf = requestAnimationFrame(animate)
+  if (flyMode.value) {
+    const speed = flyKeys.has('ShiftLeft') ? 60 : 20
+    const dir = new THREE.Vector3()
+    if (flyKeys.has('KeyW') || flyKeys.has('KeyZ')) dir.z -= 1
+    if (flyKeys.has('KeyS')) dir.z += 1
+    if (flyKeys.has('KeyA') || flyKeys.has('KeyQ')) dir.x -= 1
+    if (flyKeys.has('KeyD')) dir.x += 1
+    if (flyKeys.has('Space')) dir.y += 1
+    if (flyKeys.has('ShiftLeft') && flyKeys.has('KeyW')) dir.y += 1
+    if (flyKeys.has('ControlLeft')) dir.y -= 1
+    if (dir.lengthSq() > 0) {
+      dir.normalize().multiplyScalar(speed * 0.016)
+      dir.applyQuaternion(camera.quaternion)
+      camera.position.add(dir)
+    }
+  }
+  orbit?.update()
+  updateVisibleTiles()
+  renderer!.render(scene, camera)
+}
+
+onMounted(async () => {
+  const host = canvasHost.value!
+  renderer = new THREE.WebGLRenderer({ antialias: true })
+  renderer.setSize(host.clientWidth, host.clientHeight)
+  renderer.setPixelRatio(window.devicePixelRatio)
+  host.appendChild(renderer.domElement)
+
+  scene = new THREE.Scene()
+  scene.background = new THREE.Color(0x87ceeb)
+  scene.fog = new THREE.Fog(0x87ceeb, 200, 900)
+
+  camera = new THREE.PerspectiveCamera(70, host.clientWidth / host.clientHeight, 0.1, 3000)
+  camera.position.set(80, 120, 80)
+
+  orbit = new OrbitControls(camera, renderer.domElement)
+  orbit.target.set(8, 32, 8)
+  orbit.enableDamping = true
+  orbit.maxPolarAngle = Math.PI / 2 - 0.02
+
+  fly = new PointerLockControls(camera, renderer.domElement)
+  scene.add(fly.object ?? camera)
+
+  const sun = new THREE.DirectionalLight(0xffffff, 1.6)
+  sun.position.set(0.5, 1, 0.3).multiplyScalar(100)
+  scene.add(sun)
+  scene.add(new THREE.AmbientLight(0xb0c4de, 0.9))
+
+  window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('keyup', onKeyUp)
+
+  animate()
+
+  unlistenFns.push(
+    await listen<{ done: number; total: number; current_region: string }>('render-progress', (e) => {
+      done.value = e.payload.done
+      total.value = e.payload.total
+      currentRegion.value = e.payload.current_region
+    }),
+  )
+  unlistenFns.push(
+    await listen('render-done', () => {
+      // handled by command return value
+    }),
+  )
+  unlistenFns.push(
+    await listen('world-changed', () => {
+      // V2: live update would re-render changed regions; MVP keeps the static render.
+    }),
+  )
+
+  const onResize = () => {
+    if (!renderer) return
+    renderer.setSize(host.clientWidth, host.clientHeight)
+    camera.aspect = host.clientWidth / host.clientHeight
+    camera.updateProjectionMatrix()
+  }
+  window.addEventListener('resize', onResize)
+})
+
+onBeforeUnmount(() => {
+  cancelAnimationFrame(raf)
+  window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('keyup', onKeyUp)
+  for (const fn of unlistenFns) fn()
+  renderer?.dispose()
+})
+</script>
+
 <style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
+.app,
+.canvas-host {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
 }
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
-<style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
+.overlay {
+  position: absolute;
+  inset: 0;
   display: flex;
-  flex-direction: column;
+  align-items: center;
   justify-content: center;
+  background: rgba(15, 20, 30, 0.7);
+}
+.panel {
+  background: #1e2430;
+  color: #e8ecf4;
+  border-radius: 12px;
+  padding: 2rem 2.5rem;
   text-align: center;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+.panel h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
 }
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
+.panel button {
+  margin-top: 1rem;
+  padding: 0.6rem 1.4rem;
+  font-size: 1rem;
+  border: none;
   border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
+  background: #4f8cff;
+  color: white;
   cursor: pointer;
 }
-
-button:hover {
-  border-color: #396cd8;
+.panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.progress {
+  width: 300px;
+  height: 12px;
+  background: #10141c;
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 1rem auto;
 }
-
-input,
-button {
-  outline: none;
+.bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4f8cff, #38d39f);
+  transition: width 0.2s;
 }
-
-#greet-input {
-  margin-right: 5px;
+.error {
+  color: #ff7b72;
+  margin-top: 1rem;
+  max-width: 400px;
 }
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: white;
+  font-family: system-ui, sans-serif;
 }
-
+.hud-top {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  pointer-events: auto;
+}
+.hud-top .title {
+  background: rgba(15, 20, 30, 0.6);
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.hud-bottom {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  background: rgba(15, 20, 30, 0.6);
+  padding: 6px 12px;
+  border-radius: 8px;
+}
+button.small {
+  pointer-events: auto;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 8px;
+  background: #2c3546;
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+}
 </style>
