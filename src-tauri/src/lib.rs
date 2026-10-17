@@ -155,8 +155,8 @@ async fn dump_chunk(world_dir: String) -> Result<String, String> {
                     Ok(Some(data)) => {
                         let header = format!(
                             "region r.{rx}.{rz}, chunk {lx},{lz} (world chunk {},{}), {} bytes\n",
-                            rx * 32 + lx,
-                            rz * 32 + lz,
+                            rx * 32 + lx as i32,
+                            rz * 32 + lz as i32,
                             data.len()
                         );
                         let dump = world::dump_chunk_top_level(&data)?;
