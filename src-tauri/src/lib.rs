@@ -94,8 +94,7 @@ async fn render_world(
         (all_tiles, final_stats)
     })
     .await
-    .map_err(|e| format!("render task failed: {e}"))?
-    .map_err(|e| format!("render thread panicked: {e}"))?;
+    .map_err(|e| format!("render task failed: {e}"))?;
 
     let tiles: Vec<TileEntry> = all_tiles.into_iter().flatten().collect();
 
