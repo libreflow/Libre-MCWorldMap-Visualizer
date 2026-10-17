@@ -15,6 +15,8 @@ const TILE: u32 = 16;
 pub struct ResourcePack {
     /// "block/<name>" (no extension) -> decoded image
     textures: HashMap<String, RgbaImage>,
+    /// "grass" / "foliage" colormaps (256x256, climate-indexed)
+    pub colormaps: HashMap<String, RgbaImage>,
     /// "block/<name>" (no extension) -> raw model JSON
     models: HashMap<String, serde_json::Value>,
     /// "<block_name>" (no namespace) -> raw blockstate JSON
@@ -36,6 +38,7 @@ impl ResourcePack {
         let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read zip {path:?}: {e}"))?;
         let mut pack = ResourcePack {
             textures: HashMap::new(),
+            colormaps: HashMap::new(),
             models: HashMap::new(),
             blockstates: HashMap::new(),
         };
@@ -62,6 +65,7 @@ impl ResourcePack {
     fn open_dir(path: &Path) -> Result<Self, String> {
         let mut pack = ResourcePack {
             textures: HashMap::new(),
+            colormaps: HashMap::new(),
             models: HashMap::new(),
             blockstates: HashMap::new(),
         };
@@ -78,7 +82,12 @@ impl ResourcePack {
     }
 
     fn store(&mut self, rel: &str, bytes: &[u8]) {
-        if let Some(name) = rel.strip_prefix("textures/block/") {
+        if let Some(cm) = rel.strip_prefix("colormap/") {
+            let cm = cm.strip_suffix(".png").unwrap_or(cm);
+            if let Ok(img) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+                self.colormaps.insert(cm.to_string(), img.to_rgba8());
+            }
+        } else if let Some(name) = rel.strip_prefix("textures/block/") {
             let name = name.strip_suffix(".png").unwrap_or(name);
             if let Ok(img) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
                 self.textures
@@ -179,6 +188,18 @@ pub fn detect_vanilla_jar() -> Option<PathBuf> {
 }
 
 /// A texture atlas over every block texture in a pack, plus per-block face mapping.
+/// One non-cubic element of a model: an axis-aligned sub-box in 0..16 space
+/// with a resolved texture per face.
+#[derive(Clone, Debug)]
+pub struct ElementBox {
+    /// min corner in 16ths of a block
+    pub from: [f32; 3],
+    /// max corner in 16ths of a block
+    pub to: [f32; 3],
+    /// tile index per face direction (E, W, U, D, S, N)
+    pub tiles: [Option<usize>; 6],
+}
+
 pub struct Atlas {
     pub image: RgbaImage,
     /// uv rect per tile index, in three.js (flipY) space
@@ -191,53 +212,123 @@ pub struct Atlas {
     tiles: HashMap<String, usize>,
     /// block base name -> tile index per face direction (E,W,U,D,S,N)
     pub appearances: HashMap<String, [Option<usize>; 6]>,
+    /// block base name -> non-cubic geometry (stairs, slabs, ...). Empty = cube.
+    pub custom_shapes: HashMap<String, Vec<ElementBox>>,
+}
+
+/// Tint a texture by multiplying RGB (alpha kept) — used for grass/leaves.
+fn tint_tile(img: &RgbaImage, tint: [u8; 3]) -> RgbaImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = ((p.0[0] as u32 * tint[0] as u32) / 255).min(255) as u8;
+        p.0[1] = ((p.0[1] as u32 * tint[1] as u32) / 255).min(255) as u8;
+        p.0[2] = ((p.0[2] as u32 * tint[2] as u32) / 255).min(255) as u8;
+    }
+    out
 }
 
 impl Atlas {
     fn build(pack: &ResourcePack) -> Self {
         let mut names: Vec<&String> = pack.textures.keys().collect();
         names.sort();
-        let count = names.len() + 1; // +1: gray "missing" tile
+        // Climate variants for tinted blocks (grass, leaves): plains / forest /
+        // savanna / taiga. Additional tiles are appended after the base ones.
+        const TINTS: [(&str, [u8; 3]); 4] = [
+            ("plains", [145, 189, 89]),
+            ("forest", [121, 189, 107]),
+            ("savanna", [191, 183, 85]),
+            ("taiga", [104, 168, 113]),
+        ];
+        let tintable = |name: &str| -> bool {
+            name.contains("grass_block")
+                || name.contains("leaves")
+                || name.contains("grass") && !name.contains("block")
+        };
+        let variant_count = names.iter().filter(|n| tintable(n)).count() * TINTS.len();
+        let count = names.len() + variant_count + 1; // + tinted variants + missing tile
         let side = (count as f64).sqrt().ceil() as u32;
         let atlas_wh = side * TILE;
         let mut image = RgbaImage::new(atlas_wh, atlas_wh);
-        let mut rects = Vec::with_capacity(names.len());
+        let mut rects = Vec::with_capacity(count as usize);
         let mut tiles = HashMap::new();
         let half_texel = 0.5 / atlas_wh as f32;
-        for (i, name) in names.iter().enumerate() {
+        let mut next_slot = 0usize;
+
+        let push_tile = |image: &mut RgbaImage,
+                         rects: &mut Vec<UvRect>,
+                         tiles: &mut HashMap<String, usize>,
+                         slot: &mut usize,
+                         key: String,
+                         tile_img: RgbaImage|
+         -> usize {
+            let i = *slot;
             let col = (i as u32) % side;
             let row = (i as u32) / side;
-            let tile = normalize_tile(&pack.textures[*name]);
-            image::imageops::overlay(&mut image, &tile, (col * TILE) as i64, (row * TILE) as i64);
+            image::imageops::overlay(image, &tile_img, (col * TILE) as i64, (row * TILE) as i64);
             let u0 = col as f32 / side as f32 + half_texel;
             let u1 = (col + 1) as f32 / side as f32 - half_texel;
             let v0 = 1.0 - (row + 1) as f32 / side as f32 + half_texel;
             let v1 = 1.0 - row as f32 / side as f32 - half_texel;
             rects.push([u0, v0, u1, v1]);
-            tiles.insert((*name).clone(), i);
+            tiles.insert(key, i);
+            *slot += 1;
+            i
+        };
+
+        for name in names.iter() {
+            let tile = normalize_tile(&pack.textures[*name]);
+            push_tile(
+                &mut image,
+                &mut rects,
+                &mut tiles,
+                &mut next_slot,
+                (*name).clone(),
+                tile.clone(),
+            );
+            // Tinted climate variants for grass/leaves textures.
+            if tintable(name) {
+                for (climate, tint) in TINTS {
+                    let key = format!("{name}#{climate}");
+                    let tinted = tint_tile(&tile, tint);
+                    push_tile(
+                        &mut image,
+                        &mut rects,
+                        &mut tiles,
+                        &mut next_slot,
+                        key,
+                        tinted,
+                    );
+                }
+            }
         }
-        // Missing-texture tile (gray) at index `names.len()`
-        let missing_idx = names.len();
-        let col = (missing_idx as u32) % side;
-        let row = (missing_idx as u32) / side;
-        image::imageops::overlay(
+        // Missing-texture tile (gray)
+        let missing_idx = push_tile(
             &mut image,
-            &RgbaImage::from_pixel(TILE, TILE, Rgba([128, 128, 128, 255])),
-            (col * TILE) as i64,
-            (row * TILE) as i64,
+            &mut rects,
+            &mut tiles,
+            &mut next_slot,
+            "__missing__".to_string(),
+            RgbaImage::from_pixel(TILE, TILE, Rgba([128, 128, 128, 255])),
         );
-        let u0 = col as f32 / side as f32 + half_texel;
-        let u1 = (col + 1) as f32 / side as f32 - half_texel;
-        let v0 = 1.0 - (row + 1) as f32 / side as f32 + half_texel;
-        let v1 = 1.0 - row as f32 / side as f32 - half_texel;
-        rects.push([u0, v0, u1, v1]);
 
         let mut appearances = HashMap::new();
+        let mut custom_shapes: HashMap<String, Vec<ElementBox>> = HashMap::new();
         for (block, state) in &pack.blockstates {
             if let Some(model) = state_model(state) {
                 let faces = resolve_model_faces(&pack.models, &model);
                 let mapped = faces.map(|face| face.and_then(|t| tiles.get(&t).copied()));
                 appearances.insert(block.clone(), mapped);
+                if let Some(boxes) = resolve_model_boxes(&pack.models, &model) {
+                    let resolved: Vec<ElementBox> = boxes
+                        .into_iter()
+                        .map(|(from, to, face_names)| ElementBox {
+                            from,
+                            to,
+                            tiles: face_names.map(|f| f.and_then(|t| tiles.get(&t).copied())),
+                        })
+                        .collect();
+                    custom_shapes.insert(block.clone(), resolved);
+                }
             }
         }
 
@@ -246,6 +337,7 @@ impl Atlas {
             rects,
             tiles,
             appearances,
+            custom_shapes,
             missing_idx,
         }
     }
@@ -260,6 +352,16 @@ impl Atlas {
 
     pub fn all_rects(&self) -> &[UvRect] {
         &self.rects
+    }
+
+    /// texture name -> tile index (includes climate variants "name#plains")
+    pub fn tile_index(&self) -> &HashMap<String, usize> {
+        &self.tiles
+    }
+
+    /// block name -> non-cubic geometry (stairs, slabs...)
+    pub fn custom_shapes(&self) -> &HashMap<String, Vec<ElementBox>> {
+        &self.custom_shapes
     }
 
     /// Encode the atlas as PNG bytes.
@@ -466,4 +568,69 @@ pub fn builtin_meta() -> HashMap<String, ([f32; 3], bool)> {
         .iter()
         .map(|(n, c, t)| (n.to_string(), (tint(c), *t)))
         .collect()
+}
+
+/// Extract `elements` boxes from a model chain: (from, to, face texture names).
+/// Returns None when the model resolves to a plain cube (no elements).
+fn resolve_model_boxes(
+    models: &HashMap<String, serde_json::Value>,
+    model_ref: &str,
+) -> Option<Vec<([f32; 3], [f32; 3], [Option<String>; 6])>> {
+    let mut textures: HashMap<String, String> = HashMap::new();
+    let mut elements: Option<&Vec<serde_json::Value>> = None;
+    let mut current = Some(model_ref.to_string());
+    for _ in 0..16 {
+        let Some(name) = current else { break };
+        let Some(model) = models.get(&name) else {
+            break;
+        };
+        if let Some(tex) = model.get("textures").and_then(|t| t.as_object()) {
+            for (k, v) in tex {
+                if let Some(s) = v.as_str() {
+                    textures.insert(k.clone(), normalize_ref(s));
+                }
+            }
+        }
+        if elements.is_none() {
+            if let Some(el) = model.get("elements").and_then(|e| e.as_array()) {
+                if !el.is_empty() {
+                    elements = Some(el);
+                }
+            }
+        }
+        match model.get("parent").and_then(|p| p.as_str()) {
+            Some(p) => current = Some(normalize_ref(p)),
+            None => break,
+        }
+    }
+    let elements = elements?;
+
+    const FACE_KEYS: [(&str, usize); 6] = [
+        ("east", 0),
+        ("west", 1),
+        ("up", 2),
+        ("down", 3),
+        ("south", 4),
+        ("north", 5),
+    ];
+    let f = |v: &serde_json::Value| -> f32 { v.as_f64().map(|x| x as f32).unwrap_or(0.0) };
+    let mut out = Vec::with_capacity(elements.len());
+    for el in elements {
+        let from = [f(&el["from"][0]), f(&el["from"][1]), f(&el["from"][2])];
+        let to = [f(&el["to"][0]), f(&el["to"][1]), f(&el["to"][2])];
+        let mut face_names: [Option<String>; 6] = std::array::from_fn(|_| None);
+        if let Some(faces) = el.get("faces").and_then(|fs| fs.as_object()) {
+            for (key, dir_idx) in FACE_KEYS {
+                if let Some(tex) = faces
+                    .get(key)
+                    .and_then(|fc| fc.get("texture"))
+                    .and_then(|t| t.as_str())
+                {
+                    face_names[dir_idx] = resolve_tex(&textures, tex);
+                }
+            }
+        }
+        out.push((from, to, face_names));
+    }
+    Some(out)
 }

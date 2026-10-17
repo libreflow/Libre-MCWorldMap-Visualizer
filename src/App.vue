@@ -163,10 +163,12 @@ async function loadTile(t: TileEntry) {
           mat.map.anisotropy = 4
         }
         if (mat) {
-          mat.alphaTest = 0.5
-          mat.transparent = false
-          mat.depthWrite = true
-          mat.side = THREE.DoubleSide
+          mat.vertexColors = true
+          const isWater = mat.name === 'water'
+          mat.alphaTest = isWater ? 0 : 0.5
+          mat.transparent = isWater
+          mat.depthWrite = !isWater
+          mat.side = isWater ? THREE.FrontSide : THREE.DoubleSide
         }
       }
     })
@@ -238,8 +240,42 @@ onMounted(async () => {
   host.appendChild(renderer.domElement)
 
   scene = new THREE.Scene()
-  scene.background = new THREE.Color(0x87ceeb)
-  scene.fog = new THREE.Fog(0x87ceeb, 200, 900)
+  const skyTop = new THREE.Color(0x2a5faf)
+  const skyHorizon = new THREE.Color(0xbcd8ee)
+  const skyGeo = new THREE.SphereGeometry(2000, 16, 12)
+  const skyMat = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      top: { value: skyTop },
+      bottom: { value: skyHorizon },
+      offset: { value: 60 },
+      exponent: { value: 0.7 },
+    },
+    vertexShader: `
+      varying vec3 vWorldPosition;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 top;
+      uniform vec3 bottom;
+      uniform float offset;
+      uniform float exponent;
+      varying vec3 vWorldPosition;
+      void main() {
+        float h = normalize(vWorldPosition + offset).y;
+        gl_FragColor = vec4(mix(bottom, top, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+      }
+    `,
+  })
+  const sky = new THREE.Mesh(skyGeo, skyMat)
+  scene.add(sky)
+  scene.fog = new THREE.Fog(0xbcd8ee, 200, 900)
 
   camera = new THREE.PerspectiveCamera(70, host.clientWidth / host.clientHeight, 0.1, 3000)
   camera.position.set(80, 120, 80)
