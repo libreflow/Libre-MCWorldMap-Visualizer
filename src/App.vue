@@ -27,7 +27,10 @@
       </div>
       <div class="hud-bottom">
         <span>Clic gauche : orbite · Molette : zoom · Clic droit : pan</span>
-        <pre v-if="dumpReport" class="dump">{{ dumpReport }}</pre>
+        <div v-if="dumpReport" class="dump-wrap">
+          <button class="small dump-close" @click="dumpReport = ''">Fermer</button>
+          <pre class="dump">{{ dumpReport }}</pre>
+        </div>
         <span v-if="renderStats">chunks : {{ renderStats.chunksRead }} lus, {{ renderStats.chunksParsed }} parsés, {{ renderStats.chunksEmpty }} vides, {{ renderStats.chunksFailed }} échoués</span>
         <span v-if="renderStats?.parseErrorSample" class="error">{{ renderStats.parseErrorSample }}</span>
         <span v-if="flyMode">ZQSD/WASD + souris pour voler</span>
@@ -431,11 +434,17 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 8px;
 }
-pre.dump {
+.dump-wrap {
   position: absolute;
   bottom: 70px;
   left: 12px;
   max-width: 90%;
+  pointer-events: auto;
+}
+.dump-close {
+  margin-bottom: 6px;
+}
+pre.dump {
   max-height: 40vh;
   overflow: auto;
   background: rgba(10, 14, 20, 0.85);
