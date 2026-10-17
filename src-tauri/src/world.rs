@@ -300,21 +300,66 @@ fn open_region(path: &Path) -> Result<Region<File>, String> {
 }
 
 /// Scan the world directory and return all region files (rx, rz, path).
+/// Looks in `<world>/region/` first, then recursively (limited depth) to
+/// handle nested structures (dimension subfolders, renamed region dirs).
 pub fn find_regions(world_dir: &Path) -> Result<Vec<(i32, i32, PathBuf)>, String> {
-    let region_dir = world_dir.join("region");
-    if !region_dir.is_dir() {
-        return Err(format!("no region directory in {world_dir:?}"));
+    if !world_dir.is_dir() {
+        return Err(format!("world directory not found: {world_dir:?}"));
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&region_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some((rx, rz)) = parse_region_name(&name) else { continue };
-        out.push((rx, rz, entry.path()));
+    let mut searched = Vec::new();
+    collect_regions(&world_dir.join("region"), &mut out);
+    searched.push(world_dir.join("region"));
+    if out.is_empty() {
+        // Recursive search for any directory containing .mca files.
+        collect_regions_recursive(world_dir, 0, &mut out, &mut searched);
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "no region files (*.mca) found under {world_dir:?} (searched: {:?})",
+            searched.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>()
+        ));
     }
     out.sort_by_key(|(rx, rz, _)| (*rx, *rz));
     Ok(out)
+}
+
+fn collect_regions(region_dir: &Path, out: &mut Vec<(i32, i32, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(region_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some((rx, rz)) = parse_region_name(&name) {
+            out.push((rx, rz, entry.path()));
+        }
+    }
+}
+
+fn collect_regions_recursive(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(i32, i32, PathBuf)>,
+    searched: &mut Vec<PathBuf>,
+) {
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            // Skip cache/session dirs that never contain regions
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "playerdata" || name == "stats" || name == "advancements" {
+                continue;
+            }
+            collect_regions_recursive(&path, depth + 1, out, searched);
+        } else if let Some((rx, rz)) = parse_region_name(&path.file_name().unwrap_or_default().to_string_lossy()) {
+            out.push((rx, rz, path.clone()));
+        }
+    }
 }
 
 fn parse_region_name(name: &str) -> Option<(i32, i32)> {
