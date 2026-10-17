@@ -40,8 +40,12 @@ use fastnbt::LongArray;
 enum PaletteEntryNbt {
     /// Modern (26.3+): palette is a bare TAG_String, e.g. "minecraft:stone"
     Direct(String),
-    /// Older: palette entry is a compound { name: "minecraft:stone", ... }
-    Named { name: String },
+    /// Compound entry { Name: "minecraft:...", Properties: {...} } — the
+    /// real pre-26.3 layout uses a capital N; alias keeps lowercase working.
+    Named {
+        #[serde(alias = "Name", alias = "name")]
+        name: String,
+    },
 }
 
 impl PaletteEntryNbt {
