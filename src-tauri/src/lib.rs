@@ -1,5 +1,6 @@
 mod glb;
 mod mesh;
+mod resources;
 mod world;
 
 use rayon::prelude::*;
@@ -35,6 +36,7 @@ async fn render_world(
     app: AppHandle,
     state: State<'_, RenderState>,
     world_dir: String,
+    texture_pack_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let world_path = PathBuf::from(&world_dir);
     if !world_path.is_dir() {
@@ -50,7 +52,19 @@ async fn render_world(
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     *state.out_dir.lock().await = Some(out_dir.clone());
 
-    let renderer = WorldRenderer::new();
+    // Texture source: explicit jar/zip > auto-detected vanilla jar > color fallback.
+    let pack_path = texture_pack_path
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .or_else(resources::detect_vanilla_jar());
+    let atlas = pack_path.as_deref().and_then(|p| {
+        resources::ResourcePack::open(p)
+            .map_err(|e| log_pack_error(p, &e))
+            .ok()
+            .filter(|pack| !pack.is_empty())
+            .map(|pack| pack.build_atlas())
+    });
+    let renderer = WorldRenderer::new(atlas.as_ref());
     let total = regions.len();
     let done = std::sync::Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<(String, Vec<TileEntry>)>();
@@ -83,12 +97,22 @@ async fn render_world(
         let d = done.load(Ordering::Relaxed);
         let _ = app.emit(
             "render-progress",
-            ProgressEvent { done: d, total, current_region: label },
+            ProgressEvent {
+                done: d,
+                total,
+                current_region: label,
+            },
         );
     }
 
     let all_tiles = handle.join().map_err(|_| "render thread panicked")?;
     let tiles: Vec<TileEntry> = all_tiles.into_iter().flatten().collect();
+
+    if let Some(atlas) = &atlas {
+        if let Ok(png) = atlas.to_png() {
+            let _ = std::fs::write(out_dir.join("atlas.png"), png);
+        }
+    }
 
     let manifest = TileManifest {
         world_name: world_path
@@ -106,14 +130,23 @@ async fn render_world(
 
     let _ = app.emit(
         "render-done",
-        DoneEvent { manifest_path: manifest_path.to_string_lossy().to_string(), tiles: tiles.len() },
+        DoneEvent {
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+            tiles: tiles.len(),
+        },
     );
 
     Ok(serde_json::json!({
         "manifestPath": manifest_path.to_string_lossy(),
         "tileCount": tiles.len(),
         "regionCount": total,
+        "textured": atlas.is_some(),
+        "textureSource": pack_path.map(|p| p.to_string_lossy().to_string()),
     }))
+}
+
+fn log_pack_error(path: &Path, e: &str) {
+    eprintln!("failed to load texture pack {path:?}: {e}");
 }
 
 #[tauri::command]
@@ -147,7 +180,10 @@ async fn start_watching(
         let Ok(mut watcher) = notify::recommended_watcher(wtx) else {
             return;
         };
-        if watcher.watch(&region_dir, RecursiveMode::NonRecursive).is_err() {
+        if watcher
+            .watch(&region_dir, RecursiveMode::NonRecursive)
+            .is_err()
+        {
             return;
         }
         while let Ok(ev) = wrx.recv() {

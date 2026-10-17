@@ -299,24 +299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bluemap-tauri"
-version = "0.1.0"
-dependencies = [
- "fastanvil",
- "fastnbt",
- "notify",
- "rayon",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2100,6 +2082,23 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libre-mcworldmap-visualizer"
+version = "0.1.0"
+dependencies = [
+ "fastanvil",
+ "fastnbt",
+ "notify",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
 ]
 
 [[package]]

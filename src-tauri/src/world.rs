@@ -1,5 +1,6 @@
 use crate::glb::GlbWriter;
-use crate::mesh::{face_vertices, BlockMapper, ChunkMesh, Direction};
+use crate::mesh::{BlockMapper, ChunkMesh, Direction, face_vertices};
+use crate::resources::Atlas;
 use fastanvil::Region;
 use fastnbt::from_bytes;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,8 @@ pub struct TileEntry {
 
 pub struct WorldRenderer {
     pub mapper: BlockMapper,
+    /// PNG-encoded atlas shared by every chunk GLB (embedded per file).
+    pub atlas_png: Vec<u8>,
 }
 
 /// Bit-pack reader for packed 64-bit long arrays (Minecraft format).
@@ -73,7 +76,11 @@ impl<'a> PackedBits<'a> {
     fn new(data: &'a [i64], bits: usize, count: usize) -> Self {
         let mut entries = vec![0u16; count];
         if bits == 0 {
-            return Self { data, bits, entries };
+            return Self {
+                data,
+                bits,
+                entries,
+            };
         }
         let per_long = 64 / bits;
         for i in 0..count {
@@ -86,7 +93,11 @@ impl<'a> PackedBits<'a> {
                 }
             }
         }
-        Self { data, bits, entries }
+        Self {
+            data,
+            bits,
+            entries,
+        }
     }
 
     fn get(&self, i: usize) -> u16 {
@@ -95,8 +106,18 @@ impl<'a> PackedBits<'a> {
 }
 
 impl WorldRenderer {
-    pub fn new() -> Self {
-        Self { mapper: BlockMapper::builtin() }
+    pub fn new(atlas: Option<&Atlas>) -> Self {
+        match atlas {
+            Some(atlas) => {
+                let mapper = crate::resources::mapper_with_atlas(atlas);
+                let atlas_png = atlas.to_png().unwrap_or_default();
+                Self { mapper, atlas_png }
+            }
+            None => Self {
+                mapper: BlockMapper::fallback(),
+                atlas_png: Vec::new(),
+            },
+        }
     }
 
     /// Parse one region file (`r.X.Z.mca`) and produce one GLB per chunk.
@@ -121,7 +142,8 @@ impl WorldRenderer {
                     Ok(None) => continue,
                     Err(_) => continue,
                 };
-                let tile = self.mesh_chunk(&data, out_dir, rx * 32 + lx as i32, rz * 32 + lz as i32);
+                let tile =
+                    self.mesh_chunk(&data, out_dir, rx * 32 + lx as i32, rz * 32 + lz as i32);
                 if let Some(t) = tile {
                     tiles.push(t);
                 }
@@ -143,8 +165,12 @@ impl WorldRenderer {
         for y in WORLD_MIN_Y..(WORLD_MIN_Y + WORLD_HEIGHT as i32) {
             for z in 0..16 {
                 for x in 0..16 {
-                    let Some(state_idx) = world.block(x, y, z) else { continue };
-                    let Some(name) = world.palette_name(state_idx) else { continue };
+                    let Some(state_idx) = world.block(x, y, z) else {
+                        continue;
+                    };
+                    let Some(name) = world.palette_name(state_idx) else {
+                        continue;
+                    };
                     if world.is_air(state_idx) {
                         continue;
                     }
@@ -160,7 +186,9 @@ impl WorldRenderer {
                             Some(idx) => world.is_transparent(idx, &self.mapper),
                         };
                         if nb_transparent {
-                            let verts = face_vertices(wx, y, wz, dir, info.color);
+                            let face_idx = dir.face_idx() / 4;
+                            let uv = self.atlas_rect(info.tiles[face_idx]);
+                            let verts = face_vertices(wx, y, wz, dir, uv);
                             mesh.extend(&verts);
                         }
                     }
@@ -174,18 +202,28 @@ impl WorldRenderer {
 
         let file_name = format!("chunk_{cx}_{cz}.glb");
         let path = out_dir.join(&file_name);
-        GlbWriter::write(&path, &mesh.vertices, &mesh.indices).ok()?;
+        GlbWriter::write(&path, &mesh.vertices, &mesh.indices, &self.atlas_png).ok()?;
 
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
-        for v in mesh.vertices.chunks_exact(6) {
+        for v in mesh.vertices.chunks_exact(5) {
             for i in 0..3 {
                 min[i] = min[i].min(v[i]);
                 max[i] = max[i].max(v[i]);
             }
         }
 
-        Some(TileEntry { file: file_name, x: cx, z: cz, min, max })
+        Some(TileEntry {
+            file: file_name,
+            x: cx,
+            z: cz,
+            min,
+            max,
+        })
+    }
+
+    fn atlas_rect(&self, tile_idx: usize) -> [f32; 4] {
+        self.mapper.rect(tile_idx)
     }
 }
 
@@ -200,11 +238,14 @@ impl BlockWorld {
     fn from_chunk(chunk: &ChunkNbt) -> Self {
         let mut palette = vec!["minecraft:air".to_string()];
         let mut blocks = vec![0u16; 16 * 16 * WORLD_HEIGHT];
-        let mut palette_map: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        let mut palette_map: std::collections::HashMap<String, u16> =
+            std::collections::HashMap::new();
         palette_map.insert("minecraft:air".into(), 0);
 
         for section in &chunk.sections {
-            let Some(bs) = &section.block_states else { continue };
+            let Some(bs) = &section.block_states else {
+                continue;
+            };
             // Local palette -> global palette indices
             let mut local_to_global = Vec::with_capacity(bs.palette.len());
             for entry in &bs.palette {
@@ -250,7 +291,7 @@ impl BlockWorld {
                                 for x in 0..16 {
                                     let gi = ((wy - WORLD_MIN_Y) as usize * 16 + z) * 16 + x;
                                     blocks[gi] = g;
-                        }
+                                }
                             }
                         }
                     }
@@ -276,7 +317,10 @@ impl BlockWorld {
     }
 
     fn is_air(&self, idx: u16) -> bool {
-        matches!(self.palette_name(idx), Some("minecraft:air") | Some("minecraft:cave_air") | Some("minecraft:void_air"))
+        matches!(
+            self.palette_name(idx),
+            Some("minecraft:air") | Some("minecraft:cave_air") | Some("minecraft:void_air")
+        )
     }
 
     fn is_transparent(&self, idx: u16, mapper: &BlockMapper) -> bool {
@@ -310,7 +354,9 @@ pub fn find_regions(world_dir: &Path) -> Result<Vec<(i32, i32, PathBuf)>, String
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some((rx, rz)) = parse_region_name(&name) else { continue };
+        let Some((rx, rz)) = parse_region_name(&name) else {
+            continue;
+        };
         out.push((rx, rz, entry.path()));
     }
     out.sort_by_key(|(rx, rz, _)| (*rx, *rz));

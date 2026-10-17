@@ -6,6 +6,11 @@
       <h1>Libre-MCWorldMap-Visualizer</h1>
       <p>Sélectionnez un dossier de monde Minecraft (contenant <code>region/</code>).</p>
       <button :disabled="busy" @click="pickWorld">Ouvrir un monde…</button>
+      <div class="pack-row">
+        <button class="small" :disabled="busy" @click="pickTexturePack">{{ texturePackPath ? 'Changer le pack de textures…' : 'Pack de textures (optionnel)…' }}</button>
+        <span v-if="texturePackPath" class="pack-name">{{ texturePackName }}</span>
+      </div>
+      <p v-if="textureSource" class="hint">Textures : {{ textureSource }}</p>
       <p v-if="error" class="error">{{ error }}</p>
     </div>
 
@@ -64,6 +69,10 @@ const worldName = ref('')
 const totalTiles = ref(0)
 const loadedTiles = ref(0)
 const flyMode = ref(false)
+const texturePackPath = ref('')
+const textureSource = ref('')
+
+const texturePackName = computed(() => texturePackPath.value.split(/[\\/]/).pop() || '')
 
 const progressPct = computed(() => (total.value === 0 ? 0 : Math.round((done.value / total.value) * 100)))
 
@@ -82,6 +91,15 @@ let unlistenFns: (() => void)[] = []
 
 const VIEW_RADIUS_CHUNKS = 12
 
+async function pickTexturePack() {
+  const file = await open({
+    multiple: false,
+    title: 'Jar Minecraft ou resource pack (.jar/.zip)',
+    filters: [{ name: 'Minecraft jar / resource pack', extensions: ['jar', 'zip'] }],
+  })
+  if (typeof file === 'string') texturePackPath.value = file
+}
+
 async function pickWorld() {
   busy.value = true
   error.value = ''
@@ -89,10 +107,17 @@ async function pickWorld() {
     const dir = await open({ directory: true, multiple: false, title: 'Dossier du monde Minecraft' })
     if (!dir || typeof dir !== 'string') return
     phase.value = 'rendering'
-    const result = await invoke<{ manifestPath: string; tileCount: number; regionCount: number }>(
-      'render_world',
-      { worldDir: dir },
-    )
+    const result = await invoke<{
+      manifestPath: string
+      tileCount: number
+      regionCount: number
+      textured: boolean
+      textureSource: string | null
+    }>('render_world', {
+      worldDir: dir,
+      texturePackPath: texturePackPath.value || null,
+    })
+    textureSource.value = result.textureSource ?? ''
     cacheDir = result.manifestPath.replace(/[/\\]settings\.json$/, '')
     const manifest = await invoke<Manifest>('load_manifest', { manifestPath: result.manifestPath })
     worldName.value = manifest.world_name
@@ -124,6 +149,27 @@ async function loadTile(t: TileEntry) {
     const bytes = await invoke<number[]>('read_glb', { path: `${cacheDir}/${t.file}` })
     const buf = new Uint8Array(bytes).buffer
     const gltf = await gltfLoader.parseAsync(buf, '')
+    gltf.scene.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh) {
+        const m = o as THREE.Mesh
+        const mat = m.material as THREE.MeshStandardMaterial
+        if (mat?.map) {
+          mat.map.magFilter = THREE.NearestFilter
+          mat.map.minFilter = THREE.NearestMipmapLinearFilter
+          mat.map.generateMipmaps = true
+          mat.map.wrapS = THREE.ClampToEdgeWrapping
+          mat.map.wrapT = THREE.ClampToEdgeWrapping
+          mat.map.colorSpace = THREE.SRGBColorSpace
+          mat.map.anisotropy = 4
+        }
+        if (mat) {
+          mat.alphaTest = 0.5
+          mat.transparent = false
+          mat.depthWrite = true
+          mat.side = THREE.DoubleSide
+        }
+      }
+    })
     scene.add(gltf.scene)
     loaded.add(key)
     loadedTiles.value = loaded.size
@@ -206,10 +252,10 @@ onMounted(async () => {
   fly = new PointerLockControls(camera, renderer.domElement)
   scene.add(fly.object ?? camera)
 
-  const sun = new THREE.DirectionalLight(0xffffff, 1.6)
+  const sun = new THREE.DirectionalLight(0xffffff, 2.5)
   sun.position.set(0.5, 1, 0.3).multiplyScalar(100)
   scene.add(sun)
-  scene.add(new THREE.AmbientLight(0xb0c4de, 0.9))
+  scene.add(new THREE.AmbientLight(0xffffff, 1.2))
 
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
@@ -292,6 +338,33 @@ onBeforeUnmount(() => {
 .panel button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+.pack-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 0.75rem;
+}
+.pack-row .small {
+  margin-top: 0;
+}
+.pack-name {
+  font-size: 12px;
+  color: #9fb2cc;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hint {
+  margin: 0.5rem 0 0;
+  font-size: 12px;
+  color: #9fb2cc;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .progress {
   width: 300px;
