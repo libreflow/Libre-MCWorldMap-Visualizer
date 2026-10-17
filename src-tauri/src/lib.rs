@@ -6,7 +6,6 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
@@ -50,27 +49,29 @@ async fn render_world(
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     *state.out_dir.lock().await = Some(out_dir.clone());
 
-    let renderer = WorldRenderer::new();
     let total = regions.len();
     let done = std::sync::Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = mpsc::channel::<(String, Vec<TileEntry>)>();
-    // mpsc::Sender is !Sync; wrap so the rayon closure can capture it.
-    let tx = std::sync::Mutex::new(tx);
-
-    // Heavy work off the async runtime, parallelized per region with rayon.
-    // `done` is shared between the render thread and the progress loop below.
-    let done_thread = done.clone();
-    let out_dir_thread = out_dir.clone();
     let stats = std::sync::Arc::new(std::sync::Mutex::new(RenderStats::default()));
-    let stats_thread = stats.clone();
-    let handle = std::thread::spawn(move || {
-        // `stats` stays with the async command; the thread uses `stats_thread`.
+    let app_handle = app.clone();
+
+    // Heavy work off the async runtime (spawn_blocking), parallelized per
+    // region with rayon. Progress events are emitted directly from the
+    // worker closures: AppHandle is Send + Sync.
+    let world_name = world_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "world".into());
+
+    let (all_tiles, final_stats) = tokio::task::spawn_blocking(move || {
+        let done_thread = done.clone();
+        let stats_thread = stats.clone();
         let all_tiles: Vec<Vec<TileEntry>> = regions
             .par_iter()
             .map(|(rx, rz, path)| {
                 let label = format!("r.{rx}.{rz}");
                 let mut local_stats = RenderStats::default();
-                let result = renderer.render_region(path, &out_dir_thread, *rx, *rz, &mut local_stats);
+                let result =
+                    WorldRenderer::new().render_region(path, &out_dir, *rx, *rz, &mut local_stats);
                 let tiles = result.unwrap_or_default();
                 if let Ok(mut s) = stats_thread.lock() {
                     s.chunks_read += local_stats.chunks_read;
@@ -81,34 +82,24 @@ async fn render_world(
                         s.parse_error_sample = local_stats.parse_error_sample;
                     }
                 }
-                done_thread.fetch_add(1, Ordering::Relaxed);
-                if let Ok(tx) = tx.lock() {
-                    let _ = tx.send((label, tiles.clone()));
-                }
+                let d = done_thread.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app_handle.emit(
+                    "render-progress",
+                    ProgressEvent { done: d, total, current_region: label },
+                );
                 tiles
             })
             .collect();
-        all_tiles
-    });
+        let final_stats = stats.lock().map(|s| s.clone()).unwrap_or_default();
+        (all_tiles, final_stats)
+    })
+    .await
+    .map_err(|e| format!("render task failed: {e}"))?
+    .map_err(|e| format!("render thread panicked: {e}"))?;
 
-    while let Ok((label, _)) = rx.recv() {
-        let d = done.load(Ordering::Relaxed);
-        let _ = app.emit(
-            "render-progress",
-            ProgressEvent { done: d, total, current_region: label },
-        );
-    }
-
-    let all_tiles = handle.join().map_err(|_| "render thread panicked")?;
     let tiles: Vec<TileEntry> = all_tiles.into_iter().flatten().collect();
 
-    let manifest = TileManifest {
-        world_name: world_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "world".into()),
-        tiles: tiles.clone(),
-    };
+    let manifest = TileManifest { world_name, tiles: tiles.clone() };
     let manifest_path = out_dir.join("settings.json");
     serde_json::to_writer_pretty(
         std::fs::File::create(&manifest_path).map_err(|e| e.to_string())?,
@@ -121,7 +112,6 @@ async fn render_world(
         DoneEvent { manifest_path: manifest_path.to_string_lossy().to_string(), tiles: tiles.len() },
     );
 
-    let final_stats = stats.lock().expect("stats mutex poisoned");
     Ok(serde_json::json!({
         "manifestPath": manifest_path.to_string_lossy(),
         "tileCount": tiles.len(),
@@ -153,13 +143,22 @@ async fn read_glb(path: String) -> Result<Vec<u8>, String> {
 #[tauri::command]
 async fn start_watching(
     app: AppHandle,
-    state: State<'_, RenderState>,
     world_dir: String,
 ) -> Result<(), String> {
-    let region_dir = PathBuf::from(&world_dir).join("region");
-    if !region_dir.is_dir() {
-        return Err(format!("no region directory: {region_dir:?}"));
-    }
+    let world_path = PathBuf::from(&world_dir);
+    // Watch the same directories the renderer reads from: legacy <world>/region
+    // or the 2026 layout <world>/dimensions/minecraft/overworld/region.
+    let region_dir = world_path.join("region");
+    let region_dir = if region_dir.is_dir() {
+        region_dir
+    } else {
+        let dim = world_path.join("dimensions/minecraft/overworld/region");
+        if dim.is_dir() {
+            dim
+        } else {
+            return Err(format!("no region directory under {world_dir}"));
+        }
+    };
 
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
@@ -170,6 +169,7 @@ async fn start_watching(
         if watcher.watch(&region_dir, RecursiveMode::NonRecursive).is_err() {
             return;
         }
+        // Keep the watcher alive for the lifetime of the channel loop.
         while let Ok(ev) = wrx.recv() {
             if let Ok(e) = ev {
                 let paths: Vec<String> = e
@@ -180,8 +180,8 @@ async fn start_watching(
                 let _ = app.emit("world-changed", serde_json::json!({ "paths": paths }));
             }
         }
+        drop(watcher);
     });
-    let _ = state;
     Ok(())
 }
 

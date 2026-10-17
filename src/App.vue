@@ -92,6 +92,7 @@ const tilesByXZ = new Map<string, TileEntry>()
 let unlistenFns: (() => void)[] = []
 
 const VIEW_RADIUS_CHUNKS = 12
+const PATH_SEP = navigator.platform.startsWith('Win') ? '\\' : '/'
 
 async function pickWorld() {
   busy.value = true
@@ -108,10 +109,22 @@ async function pickWorld() {
     }>('render_world', { worldDir: dir })
     renderStats.value = result.stats
     cacheDir = result.manifestPath.replace(/[/\\]settings\.json$/, '')
+    tilesByXZ.clear()
+    tilesByCell.clear()
+    loadedTiles.value = 0
     const manifest = await invoke<Manifest>('load_manifest', { manifestPath: result.manifestPath })
     worldName.value = manifest.world_name
     totalTiles.value = manifest.tiles.length
-    for (const t of manifest.tiles) tilesByXZ.set(`${t.x},${t.z}`, t)
+    for (const t of manifest.tiles) {
+      tilesByXZ.set(`${t.x},${t.z}`, t)
+      const key = `${t.x},${t.z}`
+      let list = tilesByCell.get(key)
+      if (!list) {
+        list = []
+        tilesByCell.set(key, list)
+      }
+      list.push(t)
+    }
     phase.value = 'viewing'
     // Center the camera on the rendered data (worlds often live in negative coords).
     if (manifest.tiles.length > 0) {
@@ -139,20 +152,18 @@ async function pickWorld() {
   }
 }
 
-function tileVisible(t: TileEntry, camX: number, camZ: number): boolean {
-  const centerX = (t.min[0] + t.max[0]) / 2
-  const centerZ = (t.min[2] + t.max[2]) / 2
-  const dx = (centerX - camX) / 16
-  const dz = (centerZ - camZ) / 16
-  return dx * dx + dz * dz <= VIEW_RADIUS_CHUNKS * VIEW_RADIUS_CHUNKS
-}
+// Spatial index: chunk cell -> tiles, so per-frame visibility checks only
+// touch cells near the camera instead of scanning the whole manifest.
+const tilesByCell = new Map<string, TileEntry[]>()
+let lastCamCellX = Number.NaN
+let lastCamCellZ = Number.NaN
 
 async function loadTile(t: TileEntry) {
   const key = `${t.x},${t.z}`
   if (loaded.has(key) || loading.has(key)) return
   loading.add(key)
   try {
-    const bytes = await invoke<number[]>('read_glb', { path: `${cacheDir}/${t.file}` })
+    const bytes = await invoke<number[]>('read_glb', { path: `${cacheDir}${PATH_SEP}${t.file}` })
     const buf = new Uint8Array(bytes).buffer
     const gltf = await gltfLoader.parseAsync(buf, '')
     scene.add(gltf.scene)
@@ -166,10 +177,19 @@ async function loadTile(t: TileEntry) {
 }
 
 function updateVisibleTiles() {
-  const camX = camera.position.x
-  const camZ = camera.position.z
-  for (const t of tilesByXZ.values()) {
-    if (tileVisible(t, camX, camZ)) void loadTile(t)
+  // Re-scan only when the camera crosses into a new chunk cell.
+  const cellX = Math.floor(camera.position.x / 16)
+  const cellZ = Math.floor(camera.position.z / 16)
+  if (cellX === lastCamCellX && cellZ === lastCamCellZ) return
+  lastCamCellX = cellX
+  lastCamCellZ = cellZ
+
+  for (let dz = -VIEW_RADIUS_CHUNKS; dz <= VIEW_RADIUS_CHUNKS; dz++) {
+    for (let dx = -VIEW_RADIUS_CHUNKS; dx <= VIEW_RADIUS_CHUNKS; dx++) {
+      if (dx * dx + dz * dz > VIEW_RADIUS_CHUNKS * VIEW_RADIUS_CHUNKS) continue
+      const list = tilesByCell.get(`${cellX + dx},${cellZ + dz}`)
+      if (list) for (const t of list) void loadTile(t)
+    }
   }
 }
 
