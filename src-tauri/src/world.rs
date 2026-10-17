@@ -30,7 +30,7 @@ pub struct SectionNbt {
 }
 
 #[derive(Deserialize)]
-struct BlockStatesNbt {
+pub struct BlockStatesNbt {
     palette: Vec<PaletteEntryNbt>,
     data: Option<LongArray>,
 }
@@ -40,7 +40,6 @@ use fastnbt::LongArray;
 #[derive(Deserialize)]
 struct PaletteEntryNbt {
     name: String,
-    properties: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,30 +62,27 @@ pub struct WorldRenderer {
 }
 
 /// Bit-pack reader for packed 64-bit long arrays (Minecraft format).
-struct PackedBits<'a> {
-    data: &'a [i64],
-    bits: usize,
+struct PackedBits {
     entries: Vec<u16>,
 }
 
-impl<'a> PackedBits<'a> {
-    fn new(data: &'a [i64], bits: usize, count: usize) -> Self {
+impl PackedBits {
+    fn new(data: &[i64], bits: usize, count: usize) -> Self {
         let mut entries = vec![0u16; count];
-        if bits == 0 {
-            return Self { data, bits, entries };
-        }
-        let per_long = 64 / bits;
-        for i in 0..count {
-            let long_idx = i / per_long;
-            let offset = (i % per_long) * bits;
-            if let Some(l) = data.get(long_idx) {
-                let v = (*l as u64 >> offset) & ((1u64 << bits) - 1);
-                if let Some(e) = entries.get_mut(i) {
-                    *e = v as u16;
+        if bits > 0 {
+            let per_long = 64 / bits;
+            for i in 0..count {
+                let long_idx = i / per_long;
+                let offset = (i % per_long) * bits;
+                if let Some(l) = data.get(long_idx) {
+                    let v = (*l as u64 >> offset) & ((1u64 << bits) - 1);
+                    if let Some(e) = entries.get_mut(i) {
+                        *e = v as u16;
+                    }
                 }
             }
         }
-        Self { data, bits, entries }
+        Self { entries }
     }
 
     fn get(&self, i: usize) -> u16 {
