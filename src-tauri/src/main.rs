@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bluemap_tauri_lib::run()
+    libre_mcworldmap_visualizer_lib::run()
 }

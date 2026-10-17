@@ -46,7 +46,7 @@ async fn render_world(
         return Err("no region files found (is this a Minecraft world?)".into());
     }
 
-    let out_dir = world_path.join(".bluemap-tauri-cache");
+    let out_dir = world_path.join(".libre-mcworldmap-cache");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     *state.out_dir.lock().await = Some(out_dir.clone());
 

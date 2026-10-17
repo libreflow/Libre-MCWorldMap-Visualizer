@@ -3,7 +3,7 @@
     <div ref="canvasHost" class="canvas-host"></div>
 
     <div v-if="phase === 'idle'" class="overlay panel">
-      <h1>BlueMap-like — Tauri</h1>
+      <h1>Libre-MCWorldMap-Visualizer</h1>
       <p>Sélectionnez un dossier de monde Minecraft (contenant <code>region/</code>).</p>
       <button :disabled="busy" @click="pickWorld">Ouvrir un monde…</button>
       <p v-if="error" class="error">{{ error }}</p>
