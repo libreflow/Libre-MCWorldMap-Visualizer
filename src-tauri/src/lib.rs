@@ -62,6 +62,7 @@ async fn render_world(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "world".into());
 
+    let out_dir_blocking = out_dir.clone();
     let (all_tiles, final_stats) = tokio::task::spawn_blocking(move || {
         let done_thread = done.clone();
         let stats_thread = stats.clone();
@@ -71,7 +72,7 @@ async fn render_world(
                 let label = format!("r.{rx}.{rz}");
                 let mut local_stats = RenderStats::default();
                 let result =
-                    WorldRenderer::new().render_region(path, &out_dir, *rx, *rz, &mut local_stats);
+                    WorldRenderer::new().render_region(path, &out_dir_blocking, *rx, *rz, &mut local_stats);
                 let tiles = result.unwrap_or_default();
                 if let Ok(mut s) = stats_thread.lock() {
                     s.chunks_read += local_stats.chunks_read;
